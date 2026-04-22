@@ -1,0 +1,2 @@
+[console_scripts]
+grader = ai_final_project.main:main
