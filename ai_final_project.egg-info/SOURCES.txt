@@ -2,6 +2,7 @@ README.md
 pyproject.toml
 ai_final_project/__init__.py
 ai_final_project/__main__.py
+ai_final_project/cv_boxes.py
 ai_final_project/main.py
 ai_final_project/roster.py
 ai_final_project.egg-info/PKG-INFO
@@ -10,5 +11,9 @@ ai_final_project.egg-info/dependency_links.txt
 ai_final_project.egg-info/entry_points.txt
 ai_final_project.egg-info/requires.txt
 ai_final_project.egg-info/top_level.txt
+ai_final_project/ocr/__init__.py
+ai_final_project/ocr/engines.py
+ai_final_project/ocr/ensemble.py
+ai_final_project/ocr/types.py
 ai_final_project/ui/__init__.py
 ai_final_project/ui/main_window.py

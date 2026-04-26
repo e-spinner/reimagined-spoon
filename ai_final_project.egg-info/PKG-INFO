@@ -10,5 +10,13 @@ Requires-Dist: odfpy>=1.4.1
 Requires-Dist: pypdf>=6.10.2
 Requires-Dist: opencv-python>=4.13.0.92
 Requires-Dist: pymupdf>=1.27.2.3
+Provides-Extra: ocr-ensemble
+Requires-Dist: pytesseract>=0.3.13; extra == "ocr-ensemble"
+Requires-Dist: easyocr>=1.7.2; extra == "ocr-ensemble"
+Requires-Dist: paddleocr>=2.10.0; extra == "ocr-ensemble"
+Requires-Dist: transformers>=4.57.1; extra == "ocr-ensemble"
+Requires-Dist: torch>=2.8.0; extra == "ocr-ensemble"
+Requires-Dist: pillow>=11.3.0; extra == "ocr-ensemble"
+Requires-Dist: python-doctr>=0.11.0; extra == "ocr-ensemble"
 
 I am looking for a software alternative to automate the grading of weekly homework assignments. The requirements of this software are as follows: grading highly technical, math focused course work and written problems (like short answers). Have a graphical interface to input the pdf's to grade and output all the pdf's, graded, into a folder that can be uploaded to canvas. The answer key will be provided to the auto-grader. If the grade is of low confidence, the auto grader should inform the user for them to review. 
