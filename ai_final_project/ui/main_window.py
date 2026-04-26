@@ -967,13 +967,45 @@ class MainWindow(QMainWindow):
         if self._mixed_question_list.count() > 0:
             return
         examples = [
-            "Question 1 — Math",
-            "Question 2 — Written",
-            "Question 3 — Math",
-            "Question 4 — Written",
+            ("Question 1", "Math"),
+            ("Question 2", "Written"),
+            ("Question 3", "Math"),
+            ("Question 4", "Written"),
         ]
-        for line in examples:
-            self._mixed_question_list.addItem(QListWidgetItem(line))
+        for question_label, selected_kind in examples:
+            item = QListWidgetItem(self._mixed_question_list)
+            row = QWidget(self._mixed_question_list)
+            row_l = QHBoxLayout(row)
+            row_l.setContentsMargins(8, 6, 8, 6)
+            row_l.setSpacing(10)
+
+            label = QLabel(question_label, row)
+            label.setObjectName("SectionTitle")
+
+            type_label = QLabel(selected_kind, row)
+            type_label.setObjectName("CaptionMuted")
+            type_label.setMinimumWidth(62)
+            type_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            menu_btn = QToolButton(row)
+            menu_btn.setText("☰")
+            menu_btn.setToolTip("Set this question as Math or Written (UI placeholder).")
+            menu_btn.setObjectName("actionBtn")
+            menu_btn.setMinimumSize(34, 34)
+            q_menu = QMenu(menu_btn)
+            act_math = q_menu.addAction("Math")
+            act_written = q_menu.addAction("Written")
+            act_math.triggered.connect(lambda _=False, lbl=type_label: lbl.setText("Math"))
+            act_written.triggered.connect(lambda _=False, lbl=type_label: lbl.setText("Written"))
+            menu_btn.setMenu(q_menu)
+            menu_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+
+            row_l.addWidget(label, stretch=1)
+            row_l.addWidget(type_label, stretch=0)
+            row_l.addWidget(menu_btn, stretch=0)
+
+            item.setSizeHint(row.sizeHint())
+            self._mixed_question_list.setItemWidget(item, row)
 
     def _on_mode_changed(self, _id: int) -> None:
         # Keep UI and status text aligned with whichever mode is active.
