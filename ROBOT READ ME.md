@@ -14,6 +14,7 @@
 - must be reasonably fast
 - must be as accurate as possible
 - PDF will be the main document format
+
 ## Pipeline 
 
 1. Students will submit a PDF containing examples of how they write letters, numbers, fractions, square roots, parenthesis, ect. so that an ai model can be optimized for their specific handwriting. 
@@ -31,3 +32,8 @@
 	1. output to excel if excel is detected 
 	2. output to LibreOffice calc if calc is detected 
 7. END
+
+## some Requirements 
+The app must be made into an executable and not require the command line at the end of the development. 
+
+no paid API's are allowed because all of this must be run locally. 

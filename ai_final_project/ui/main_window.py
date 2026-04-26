@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 
 from PySide6.QtCore import QSize, Qt, QTimer, QSettings
 from PySide6.QtGui import QAction, QColor, QFont
@@ -45,6 +46,7 @@ _THEME_CARD_DEEP = "#181818"
 _THEME_TEXT = "#ffffff"
 _THEME_MUTED = "#a8a8a8"
 _LIST_HOVER_NEUTRAL = "#2c2c2c"
+SUPPORTED_SUBMISSION_SUFFIXES: tuple[str, ...] = (".pdf",)
 
 # Accent preset tuple order is intentionally compact because these values are
 # expanded into `AccentPalette` and used all over the stylesheet.
@@ -73,6 +75,84 @@ class AccentPalette:
     fill_active: str
     # List-row hover color (kept neutral to avoid visual noise).
     list_hover: str
+
+
+@dataclass(frozen=True)
+class ParsedPdfInfo:
+    path: Path
+    page_count: int
+    question_count: int
+    total_points: int
+
+
+@dataclass(frozen=True)
+class ParsedSubmissionFolder:
+    pdf_files: list[Path]
+    unsupported_files: list[Path]
+    unsupported_manifest: Path | None
+
+
+def _extract_pdf_text_local(pdf_path: Path) -> str:
+    """Extract text from a PDF using local-only dependency if available."""
+    try:
+        from pypdf import PdfReader
+    except Exception as e:
+        raise RuntimeError(
+            "PDF parsing requires local package 'pypdf'. Install with: pip install pypdf"
+        ) from e
+
+    reader = PdfReader(str(pdf_path))
+    chunks: list[str] = []
+    for page in reader.pages:
+        try:
+            chunks.append(page.extract_text() or "")
+        except Exception:
+            # Keep parser resilient to per-page extraction failures.
+            chunks.append("")
+    return "\n".join(chunks)
+
+
+def parse_answer_key_pdf(pdf_path: Path) -> ParsedPdfInfo:
+    text = _extract_pdf_text_local(pdf_path)
+    # Lightweight heuristics until a formal rubric parser exists.
+    question_hits = len(
+        re.findall(r"\b(?:question|q)\s*[\.:#-]?\s*\d+\b", text, flags=re.IGNORECASE)
+    )
+    points = [int(m) for m in re.findall(r"\b(\d{1,3})\s*(?:points?|pts?)\b", text, flags=re.IGNORECASE)]
+    total_points = sum(points)
+    try:
+        from pypdf import PdfReader
+
+        page_count = len(PdfReader(str(pdf_path)).pages)
+    except Exception:
+        page_count = 0
+    return ParsedPdfInfo(
+        path=pdf_path,
+        page_count=page_count,
+        question_count=question_hits,
+        total_points=total_points,
+    )
+
+
+def parse_submissions_folder(folder: Path) -> ParsedSubmissionFolder:
+    entries = sorted([p for p in folder.iterdir() if p.is_file()], key=lambda p: p.name.lower())
+    pdfs = [p for p in entries if p.suffix.lower() in SUPPORTED_SUBMISSION_SUFFIXES]
+    unsupported = [p for p in entries if p.suffix.lower() not in SUPPORTED_SUBMISSION_SUFFIXES]
+    manifest: Path | None = None
+    if unsupported:
+        manifest = folder / "unsupported_files_for_review.txt"
+        lines = [
+            "Unsupported files found during submission import:",
+            "",
+        ]
+        for p in unsupported:
+            lines.append(f"- {p.name}")
+        manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return ParsedSubmissionFolder(
+        pdf_files=pdfs,
+        unsupported_files=unsupported,
+        unsupported_manifest=manifest,
+    )
 
 
 def accent_palette_from_preset(key: str) -> AccentPalette:
@@ -466,6 +546,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1020, 640)
 
         self._answer_key_path: Path | None = None
+        self._answer_key_info: ParsedPdfInfo | None = None
         self._submissions_folder: Path | None = None
         # Number of items requiring manual review after a grading run.
         self._low_confidence_count: int = 0
@@ -1031,21 +1112,23 @@ class MainWindow(QMainWindow):
         # Reset search so all newly loaded items are visible by default.
         self._search_edit.clear()
 
-        # Current grading pipeline expects PDFs; non-PDF files are only reported for now.
-        pdfs = sorted(p.name for p in self._submissions_folder.iterdir() if p.suffix.lower() == ".pdf")
-        others = [p for p in self._submissions_folder.iterdir() if p.is_file() and p.suffix.lower() != ".pdf"]
-        for name in pdfs:
-            self._submissions_list.addItem(QListWidgetItem(name))
+        # Parse folder into supported/unsupported files with a review manifest.
+        parsed = parse_submissions_folder(self._submissions_folder)
+        for pdf in parsed.pdf_files:
+            self._submissions_list.addItem(QListWidgetItem(pdf.name))
 
-        if not pdfs:
+        if not parsed.pdf_files:
             self._submissions_list.addItem(QListWidgetItem("(No PDF files in this folder)"))
 
         extra = ""
-        if others:
+        if parsed.unsupported_files:
             extra = (
-                f" {len(others)} non-PDF file(s) — in production these go to a review folder."
+                f" {len(parsed.unsupported_files)} unsupported file(s) listed in "
+                f"{parsed.unsupported_manifest.name if parsed.unsupported_manifest else 'review file'}."
             )
-        self._status.setText(f"Loaded {len(pdfs)} PDF(s) from “{self._submissions_folder.name}”.{extra}")
+        self._status.setText(
+            f"Loaded {len(parsed.pdf_files)} PDF submission(s) from “{self._submissions_folder.name}”.{extra}"
+        )
         self._progress.setValue(0)
 
     def _on_handwriting_training(self) -> None:
@@ -1067,8 +1150,22 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        self._answer_key_path = Path(path)
-        self._status.setText(f"Answer key: {self._answer_key_path.name}")
+        answer_key_path = Path(path)
+        try:
+            parsed = parse_answer_key_pdf(answer_key_path)
+        except Exception as e:
+            QMessageBox.warning(self, "Answer key", f"Could not parse answer key PDF:\n{e}")
+            return
+        self._answer_key_path = answer_key_path
+        self._answer_key_info = parsed
+        details: list[str] = [f"Answer key parsed: {parsed.path.name}"]
+        if parsed.page_count > 0:
+            details.append(f"{parsed.page_count} page(s)")
+        if parsed.question_count > 0:
+            details.append(f"{parsed.question_count} question marker(s)")
+        if parsed.total_points > 0:
+            details.append(f"{parsed.total_points} point(s) detected")
+        self._status.setText(" · ".join(details))
 
     def _on_export_grades(self) -> None:
         QMessageBox.information(
