@@ -48,7 +48,7 @@ def _strip_header_if_present(names: list[str]) -> list[str]:
             "last name",
         }
     )
-    if first in header_hints or first.endswith(" name"):
+    if first in header_hints or first.endswith(" name") or first.endswith(" names"):
         return names[1:]
     return names
 
