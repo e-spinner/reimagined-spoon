@@ -2,13 +2,13 @@ Metadata-Version: 2.4
 Name: ai-final-project
 Version: 0.1.0
 Summary: Add your description here
-Requires-Python: >=3.14
+Requires-Python: >=3.12
 Description-Content-Type: text/markdown
 Requires-Dist: pyside6>=6.11.0
 Requires-Dist: openpyxl>=3.1.0
 Requires-Dist: odfpy>=1.4.1
 Requires-Dist: pypdf>=6.10.2
-Requires-Dist: opencv-python>=4.13.0.92
+Requires-Dist: opencv-python<4.11,>=4.10.0.84
 Requires-Dist: pymupdf>=1.27.2.3
 Provides-Extra: ocr-ensemble
 Requires-Dist: pytesseract>=0.3.13; extra == "ocr-ensemble"

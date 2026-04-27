@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 
+import fitz
 from PySide6.QtCore import QSize, Qt, QTimer, QSettings
 from PySide6.QtGui import QAction, QColor, QFont
 from PySide6.QtWidgets import (
@@ -34,6 +35,10 @@ from PySide6.QtWidgets import (
 )
 
 from ai_final_project.roster import read_student_names
+from ai_final_project.grading_extract import (
+    parse_answer_key_scoring,
+    extract_submission_numeric_answer,
+)
 
 # Theme strategy:
 # - Use fixed dark neutrals for the overall shell so contrast stays stable.
@@ -552,6 +557,7 @@ class MainWindow(QMainWindow):
         self._low_confidence_count: int = 0
         # Imported names from roster spreadsheet, used for quick sanity checks.
         self._roster_names: list[str] = []
+        self._roster_path: Path | None = None
         self._accent, self._accent_preset_key = load_saved_accent_palette()
 
         self._build_actions()
@@ -1033,6 +1039,7 @@ class MainWindow(QMainWindow):
             )
             return
         self._roster_names = names
+        self._roster_path = roster_path
         self._update_roster_summary()
         self._status.setText(f"Roster loaded: {len(names)} student name(s) from “{roster_path.name}”.")
 
@@ -1185,13 +1192,87 @@ class MainWindow(QMainWindow):
 
         self._progress.setRange(0, 0)
         # Indeterminate progress bar while simulated work is "running".
-        self._status.setText("Grading (stub)…")
+        self._status.setText("Grading…")
 
         def finish_stub() -> None:
-            # Simulate outputs so the rest of the UI can be exercised end-to-end.
+            # Math mode now runs real CV+OCR extraction; other modes stay stubbed.
             self._progress.setRange(0, 100)
             self._progress.setValue(100)
             self._graded_list.clear()
+            if self._btn_math.isChecked():
+                if not self._submissions_folder:
+                    QMessageBox.warning(self, "Run grading", "Load a submissions folder first.")
+                    self._status.setText("Grading stopped: no submissions folder loaded.")
+                    return
+                if not self._answer_key_path:
+                    QMessageBox.warning(self, "Run grading", "Set an answer key PDF first.")
+                    self._status.setText("Grading stopped: no answer key selected.")
+                    return
+                try:
+                    scoring = parse_answer_key_scoring(self._answer_key_path)
+                except Exception as e:
+                    QMessageBox.warning(self, "Run grading", f"Could not parse numeric answer from key:\n{e}")
+                    self._status.setText("Grading stopped: answer key numeric parse failed.")
+                    return
+
+                outputs = 0
+                low_conf = 0
+                grade_rows: list[tuple[str, str]] = []
+                graded_output_dir = self._submissions_folder / "graded_outputs"
+                graded_output_dir.mkdir(parents=True, exist_ok=True)
+                for i in range(self._submissions_list.count()):
+                    item = self._submissions_list.item(i)
+                    if not item:
+                        continue
+                    text = item.text()
+                    if text.startswith("("):
+                        continue
+                    submission_path = self._submissions_folder / text
+                    if not submission_path.exists():
+                        self._graded_list.addItem(QListWidgetItem(f"graded_{text} — missing file"))
+                        low_conf += 1
+                        continue
+                    try:
+                        extracted = extract_submission_numeric_answer(submission_path)
+                        got = extracted.numeric_answer
+                        ok = abs(got - scoring.expected_answer) < 1e-6
+                        awarded = scoring.max_points if ok else scoring.wrong_points
+                        pct = (awarded / scoring.max_points * 100.0) if scoring.max_points > 0 else 0.0
+                        self._write_math_annotations(
+                            src_pdf=submission_path,
+                            dst_pdf=graded_output_dir / f"graded_{text}",
+                            extracted=extracted,
+                            awarded_points=awarded,
+                            max_points=scoring.max_points,
+                            percent=pct,
+                            is_correct=ok,
+                        )
+                        mark = "✓" if ok else "✗"
+                        item_text = (
+                            f"graded_{text} — {mark} got {got:.2f}, expected {scoring.expected_answer:.2f} "
+                            f"· {awarded:.2f}/{scoring.max_points:.2f} ({pct:.1f}%) "
+                            f"({extracted.best_candidate.source})"
+                        )
+                        if not ok:
+                            low_conf += 1
+                        grade_rows.append((self._name_from_submission_filename(text), f"{awarded:.2f} ({pct:.1f}%)"))
+                        outputs += 1
+                    except Exception as e:
+                        item_text = f"graded_{text} — ⚠ extraction failed: {e}"
+                        low_conf += 1
+                    self._graded_list.addItem(QListWidgetItem(item_text))
+
+                self._low_confidence_count = low_conf
+                self._refresh_review_banner()
+                sheet_path = self._write_grades_spreadsheet(grade_rows)
+                self._status.setText(
+                    f"Math run complete. {outputs} output(s). "
+                    f"{self._low_confidence_count} item(s) need review. "
+                    f"Spreadsheet: {sheet_path.name}."
+                )
+                return
+
+            # Simulated outputs for written/mixed until those paths are wired.
             for i in range(self._submissions_list.count()):
                 item = self._submissions_list.item(i)
                 text = item.text()
@@ -1199,16 +1280,106 @@ class MainWindow(QMainWindow):
                     # Skip informational placeholder rows.
                     continue
                 self._graded_list.addItem(QListWidgetItem(f"graded_{text}"))
-            # Produce a non-zero review count so banner behavior can be tested.
             self._low_confidence_count = min(3, max(1, self._graded_list.count()))
             self._refresh_review_banner()
             self._status.setText(
-                f"Stub run complete. {self._graded_list.count()} output(s). "
+                f"Stub run complete ({'Written' if self._btn_written.isChecked() else 'Mixed'} mode). "
+                f"{self._graded_list.count()} output(s). "
                 f"{self._low_confidence_count} low-confidence — review before export."
             )
 
         # Delay mimics asynchronous grading completion.
         QTimer.singleShot(900, finish_stub)
+
+    def _write_math_annotations(
+        self,
+        *,
+        src_pdf: Path,
+        dst_pdf: Path,
+        extracted,
+        awarded_points: float,
+        max_points: float,
+        percent: float,
+        is_correct: bool,
+    ) -> None:
+        doc = fitz.open(str(src_pdf))
+        try:
+            if len(doc) == 0:
+                return
+            page = doc[0]
+            answer = extracted.detection.answer_box
+            # Use ASCII "X" for incorrect marks so text extraction remains reliable.
+            symbol = "✓" if is_correct else "X"
+            color = (0.1, 0.65, 0.2) if is_correct else (0.82, 0.15, 0.15)
+            # Place check/x near the detected answer box.
+            page.insert_text(
+                fitz.Point(answer.x + answer.w + 8, answer.y + 16),
+                symbol,
+                fontsize=18,
+                color=color,
+            )
+            # Put score summary near top-right area of first page.
+            summary = f"{awarded_points:.2f}/{max_points:.2f}  ({percent:.1f}%)"
+            page.insert_text(
+                fitz.Point(380, 56),
+                summary,
+                fontsize=12,
+                color=(0.15, 0.15, 0.15),
+            )
+            doc.save(str(dst_pdf))
+        finally:
+            doc.close()
+
+    def _write_grades_spreadsheet(self, rows: list[tuple[str, str]]) -> Path:
+        # Keep "same names sheet, second column" behavior when roster spreadsheet
+        # is available as xlsx/xlsm; otherwise generate a new xlsx in submissions.
+        try:
+            from openpyxl import Workbook, load_workbook
+        except Exception as e:
+            raise RuntimeError("Spreadsheet export requires openpyxl.") from e
+
+        target_dir = self._submissions_folder or Path.cwd()
+        grade_map = {self._normalize_name_key(n): v for n, v in rows}
+
+        if self._roster_path and self._roster_path.suffix.lower() in {".xlsx", ".xlsm"} and self._roster_path.exists():
+            wb = load_workbook(self._roster_path)
+            try:
+                ws = wb.active
+                for r in range(1, ws.max_row + 1):
+                    name = ws.cell(row=r, column=1).value
+                    if not name:
+                        continue
+                    key = self._normalize_name_key(str(name))
+                    if key in grade_map:
+                        ws.cell(row=r, column=2, value=grade_map[key])
+                out = target_dir / "grades_from_roster.xlsx"
+                wb.save(out)
+                return out
+            finally:
+                wb.close()
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Grades"
+        ws.cell(row=1, column=1, value="Name")
+        ws.cell(row=1, column=2, value="Grade")
+        for i, (name, grade_text) in enumerate(rows, start=2):
+            ws.cell(row=i, column=1, value=name)
+            ws.cell(row=i, column=2, value=grade_text)
+        out = target_dir / "grades_output.xlsx"
+        wb.save(out)
+        return out
+
+    def _name_from_submission_filename(self, filename: str) -> str:
+        stem = Path(filename).stem
+        # Strip assignment suffix patterns like HW1 / hw_01.
+        stem = re.sub(r"(?i)hw[_\-\s]*\d+.*$", "", stem).strip("_- ")
+        # Split CamelCase tokens (MichaelSmith -> Michael Smith).
+        spaced = re.sub(r"(?<!^)([A-Z])", r" \1", stem).strip()
+        return spaced or Path(filename).stem
+
+    def _normalize_name_key(self, name: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", name.lower())
 
     def _on_submission_changed(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
         if current is None or current.text().startswith("("):

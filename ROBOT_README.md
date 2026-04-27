@@ -21,6 +21,9 @@ The current implementation is a functional UI scaffold with several real input/p
   - `odfpy` for `.ods`
 - PDF parsing (currently used by code but not declared in `pyproject.toml`):
   - `pypdf` (optional runtime dependency for answer-key parsing)
+- Computer vision / OCR:
+  - `opencv-python` + `pymupdf` for PDF page rendering and answer-box detection
+  - Ensemble wrappers for `tesseract`, `easyocr`, `paddleocr`, `trocr` (`transformers`/`torch`), and `docTR`
 
 ## 3) High-Level Structure
 
@@ -34,6 +37,12 @@ The current implementation is a functional UI scaffold with several real input/p
   - Core application: theme system, all widgets/layouts, actions, handlers, parsing helpers.
 - `ai_final_project/roster.py`
   - Roster file parsing and normalization for Excel/Calc files.
+- `ai_final_project/grading_extract.py`
+  - Math-mode extraction pipeline for:
+    - bottom-right marker verification
+    - answer-box crop OCR
+    - numeric answer extraction from submission and answer-key PDFs
+    - answer-key scoring parse (`expected_answer`, `max_points`, `wrong_points`)
 
 ## 4) App Startup Flow
 
@@ -94,6 +103,24 @@ Mixed mode behavior:
   - Three-line menu (`☰`) that switches label between `Math` and `Written`
 
 Important: mixed mode selection is currently UI-only and not connected to grading logic yet.
+
+Current run behavior by mode:
+- Math mode:
+  - `Run grading` now executes a real local path for each submission PDF:
+    1. Parse expected numeric answer from the selected answer-key PDF.
+    2. Parse scoring values from answer key (`max_points`, `wrong_points`).
+    2. Detect/check filled bottom-right marker box.
+    3. Crop the associated answer box.
+    4. OCR the crop (stability-first engine path).
+    5. Compare extracted numeric value to answer-key value.
+    6. Award points + compute percentage.
+    7. Annotate graded PDF with check/X marker and top summary (`awarded/max (percent)`).
+    8. Export grades spreadsheet (grade text in column B).
+  - Graded list entries include extracted value, expected value, and pass/fail marker.
+- Written mode:
+  - Still stubbed (placeholder output generation).
+- Mixed mode:
+  - Still stubbed (placeholder output generation; per-question mapping UI remains non-binding).
 
 ## 8) Student Submission Input and Parsing
 
@@ -163,29 +190,96 @@ UI then compares imported count to expected count (`QSpinBox`) and shows mismatc
 - Submissions folder parsing + unsupported-file manifest generation
 - Answer key PDF ingestion + heuristic parsing
 - Roster spreadsheet import and normalization
+- CV answer-region detection pipeline:
+  - detects filled lower-right marker box
+  - locates matching bottom-right answer box
+  - exports debug overlay/crops for human review
+- Modular OCR ensemble scaffolding:
+  - task-aware profiles (`typed`, `handwriting`, `mixed`)
+  - pluggable engine adapters with per-engine confidence output
+  - low-confidence/manual-review flagging in aggregation result
+- Math-mode grading integration (partial):
+  - `Run grading` now calls real CV+OCR numeric extraction in Math mode
+  - compares extracted numeric answer against answer-key numeric answer
+  - updates review counts and status from real extraction outcomes
+  - annotates graded PDFs (check/X + top score summary)
+  - writes spreadsheet grades to second column
+- Numeric extraction service:
+  - robust parsing for OCR-formatted decimals (`3,45`, `3 . 45`, `3 45`)
+  - strict answer-key parsing preference for explicit `Answer: <value>` lines
+- Answer-key scoring parse:
+  - extracts `max_points` from `N pts/points`
+  - extracts `wrong_points` from `Wrong answer = Npts` patterns
 
 ### Stub / Placeholder
-- Actual OCR pipeline (math/written recognition)
+- Written/Mixed grading logic still stubbed
 - Student handwriting model training
-- Real grading logic and confidence scoring
+- Rubric-wide scoring logic and confidence policy beyond numeric answer checks
 - Real PDF annotation (checkmarks/x marks/point overlays)
 - Spreadsheet export implementation
 - Canvas-ready final output pipeline
 
-## 13) Dependency Notes
+## 13) OCR Runtime Status (Current)
+
+Option A is currently in use: continue without Kraken/Calamari and run the available local engines.
+
+Validated as running in this project environment:
+- `tesseract` (CLI installed) + `pytesseract` wrapper
+- `easyocr`
+- `trocr` (`transformers` + `torch`) after model cache/network setup
+- `docTR` after model download into project cache
+
+Installed but currently unavailable in the active Python runtime:
+- `paddleocr` wrapper package is installed, but backend `paddlepaddle` cannot be installed on Python 3.14 due to missing `cp314` wheels.
+  - Current practical resolution is to keep PaddleOCR disabled in this runtime, or run PaddleOCR in a separate Python 3.13 environment.
+
+Deferred for now:
+- `kraken`
+- `calamari`
+
+Caching behavior:
+- OCR/model caches are configured to write under project-local cache paths to avoid home-directory permission issues during sandboxed/dev runs.
+
+## 14) Dependency Notes
 
 Declared in `pyproject.toml`:
 - `pyside6`
 - `openpyxl`
 - `odfpy`
-
-Used by code but currently missing from declared dependencies:
 - `pypdf`
+- `opencv-python`
+- `pymupdf`
 
-Recommended update:
-- Add `pypdf` to `pyproject.toml` dependencies so answer-key parsing works in clean environments.
+Optional OCR extras are declared for the active ensemble subset:
+- `pytesseract`
+- `easyocr`
+- `paddleocr`
+- `transformers`
+- `torch`
+- `pillow`
+- `python-doctr`
 
-## 14) Current Execution/Packaging Model
+Known compatibility note:
+- `paddlepaddle` wheels are not currently available for Python 3.14 (`cp314`) in this setup, which blocks PaddleOCR runtime use on this interpreter.
+
+## 15) Test Fixtures and Verification Artifacts
+
+To keep tests deterministic even if reference files change, fixture copies are stored in:
+- `Unit Tests/fixtures/`
+  - `MichaelSmithHW1.pdf`
+  - `Example Answer key.pdf`
+  - `Example Name sheet.ods`
+
+Annotation and spreadsheet tests write manual-review artifacts to:
+- `Unit Tests/output/math_artifacts/`
+  - `graded_sample_correct.pdf`
+  - `graded_sample_wrong.pdf`
+  - `grades_output.xlsx`
+  - matching `*.summary.txt` files with expected score text
+
+These files are intended for human verification of PDF annotation and spreadsheet export output.
+
+## 16) Current Execution/Packaging Model
 
 Available entrypoints:
 - Module/package path:
@@ -197,15 +291,14 @@ Available entrypoints:
 
 Packaging for non-command-line end users is not fully configured yet (no final executable bundling config in this repository at this time).
 
-## 15) Suggested Next Milestones
+## 17) Suggested Next Milestones
 
-1. Add `pypdf` to declared dependencies.
-2. Introduce a parser service layer (move parsing helpers out of UI module).
-3. Add typed models for rubric/questions and parsed submission documents.
-4. Implement local OCR stack (no paid APIs) with confidence outputs.
-5. Connect mixed-mode per-question settings to grading route selection.
-6. Implement graded PDF rendering and spreadsheet export.
-7. Add unit tests for roster parsing, answer-key parsing heuristics, and submission-folder classification.
+1. Add runtime capability reporting so the app shows which OCR engines are available on startup (with reasons for disabled engines).
+2. Extend real extraction path from Math mode into Written and Mixed flows.
+3. Connect mixed-mode per-question settings to grading/OCR task selection.
+4. Implement full rubric scoring + low-confidence review queue from OCR outputs.
+5. Implement graded PDF rendering (marks, points, percentage placement) and spreadsheet export.
+6. Add executable packaging workflow with first-run model cache/bootstrap checks.
 
 ---
 
