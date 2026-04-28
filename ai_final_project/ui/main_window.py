@@ -39,6 +39,11 @@ from ai_final_project.grading_extract import (
     parse_answer_key_scoring,
     extract_submission_numeric_answer,
 )
+from ai_final_project.mixed_grading import (
+    combined_total_points,
+    compute_mixed_scores,
+    mixed_needs_from_kinds,
+)
 from ai_final_project.written_response_grader import (
     WrittenResponseGradeResult,
     append_written_response_manual_review,
@@ -62,6 +67,9 @@ SUPPORTED_SUBMISSION_SUFFIXES: tuple[str, ...] = (".pdf",)
 # Graded PDF overlays: bold + high-contrast red so scores read clearly on printouts.
 _GRADE_OVERLAY_RGB: tuple[float, float, float] = (0.88, 0.0, 0.05)
 _GRADE_OVERLAY_FONT: str = "hebo"  # Helvetica-Bold (PDF base-14)
+
+# QListWidgetItem data for mixed-mode rows: "math" | "written"
+_MIXED_KIND_ROLE = int(Qt.ItemDataRole.UserRole) + 37
 
 # Accent preset tuple order is intentionally compact because these values are
 # expanded into `AccentPalette` and used all over the stylesheet.
@@ -562,6 +570,8 @@ class MainWindow(QMainWindow):
 
         self._answer_key_path: Path | None = None
         self._answer_key_info: ParsedPdfInfo | None = None
+        # Mixed mode: optional separate PDF for keyword written rubric (math uses primary key).
+        self._mixed_written_answer_key_path: Path | None = None
         self._submissions_folder: Path | None = None
         # Number of items requiring manual review after a grading run.
         self._low_confidence_count: int = 0
@@ -748,8 +758,8 @@ class MainWindow(QMainWindow):
         self._btn_mixed.setText("  Mixed (per question)")
         self._btn_mixed.setCheckable(True)
         self._btn_mixed.setToolTip(
-            "Same assignment uses math-style grading for some questions and written-style for others. "
-            "Define which below (stub list until the answer key is linked)."
+            "Runs the built-in math grader for rows marked Math and the keyword written grader for "
+            "rows marked Written. Primary answer key = math rubric; set a written key if needed."
         )
 
         self._mode_group = QButtonGroup(self)
@@ -770,19 +780,34 @@ class MainWindow(QMainWindow):
         cap_mix = QLabel("PER-QUESTION TYPES", self)
         cap_mix.setObjectName("CaptionMuted")
         hint_mix = QLabel(
-            "Each question can be marked Math or Written. "
-            "The grader will use the right model per item.",
-            self,
+            "Each row sets whether that slot uses the math (numeric/OCR) or written (keyword) grader. "
+            "If both appear, both graders run once each and scores are combined on the output PDF."
         )
         hint_mix.setObjectName("mixedHint")
         hint_mix.setWordWrap(True)
+        written_key_row = QWidget(self)
+        written_key_l = QHBoxLayout(written_key_row)
+        written_key_l.setContentsMargins(0, 0, 0, 0)
+        written_key_l.setSpacing(8)
+        self._btn_mixed_written_key = QPushButton("Written answer key…", self)
+        self._btn_mixed_written_key.setObjectName("actionBtn")
+        self._btn_mixed_written_key.setToolTip(
+            "PDF with points and 'Answer keyword list:' (same format as Written-only mode). "
+            "Leave unset to try the primary answer key."
+        )
+        self._btn_mixed_written_key.clicked.connect(self._on_set_mixed_written_answer_key)
+        self._mixed_written_key_label = QLabel("(using primary answer key)", self)
+        self._mixed_written_key_label.setObjectName("CaptionMuted")
+        self._mixed_written_key_label.setWordWrap(True)
+        written_key_l.addWidget(self._btn_mixed_written_key, stretch=0)
+        written_key_l.addWidget(self._mixed_written_key_label, stretch=1)
         self._mixed_question_list = QListWidget(self)
-        # Placeholder until rubric/question extraction from answer key is wired.
         self._mixed_question_list.setToolTip(
-            "Example layout: final app will read rubric sections from your answer key PDF."
+            "Use the row menu (☰) to switch each question between Math and Written."
         )
         mixed_l.addWidget(cap_mix)
         mixed_l.addWidget(hint_mix)
+        mixed_l.addWidget(written_key_row)
         mixed_l.addWidget(self._mixed_question_list, stretch=1)
 
         self._btn_load_folder = QPushButton("Load submissions folder", self)
@@ -1057,8 +1082,11 @@ class MainWindow(QMainWindow):
         mixed = self._btn_mixed.isChecked()
         self._mixed_section.setVisible(mixed)
         if mixed:
-            # Seed demo rows once until question extraction from the answer key exists.
             self._ensure_mixed_stub_items()
+            if self._mixed_written_answer_key_path:
+                self._mixed_written_key_label.setText(self._mixed_written_answer_key_path.name)
+            else:
+                self._mixed_written_key_label.setText("(using primary answer key)")
 
     def _ensure_mixed_stub_items(self) -> None:
         # Populate once so toggling in/out of mixed mode does not duplicate rows.
@@ -1072,6 +1100,8 @@ class MainWindow(QMainWindow):
         ]
         for question_label, selected_kind in examples:
             item = QListWidgetItem(self._mixed_question_list)
+            kind = "math" if selected_kind == "Math" else "written"
+            item.setData(_MIXED_KIND_ROLE, kind)
             row = QWidget(self._mixed_question_list)
             row_l = QHBoxLayout(row)
             row_l.setContentsMargins(8, 6, 8, 6)
@@ -1087,14 +1117,18 @@ class MainWindow(QMainWindow):
 
             menu_btn = QToolButton(row)
             menu_btn.setText("☰")
-            menu_btn.setToolTip("Set this question as Math or Written (UI placeholder).")
+            menu_btn.setToolTip("Set this question as Math or Written.")
             menu_btn.setObjectName("actionBtn")
             menu_btn.setMinimumSize(34, 34)
             q_menu = QMenu(menu_btn)
             act_math = q_menu.addAction("Math")
             act_written = q_menu.addAction("Written")
-            act_math.triggered.connect(lambda _=False, lbl=type_label: lbl.setText("Math"))
-            act_written.triggered.connect(lambda _=False, lbl=type_label: lbl.setText("Written"))
+            act_math.triggered.connect(
+                lambda _=False, it=item, lbl=type_label: self._apply_mixed_row_kind(it, lbl, "math")
+            )
+            act_written.triggered.connect(
+                lambda _=False, it=item, lbl=type_label: self._apply_mixed_row_kind(it, lbl, "written")
+            )
             menu_btn.setMenu(q_menu)
             menu_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
 
@@ -1184,6 +1218,40 @@ class MainWindow(QMainWindow):
             details.append(f"{parsed.total_points} point(s) detected")
         self._status.setText(" · ".join(details))
 
+    def _on_set_mixed_written_answer_key(self) -> None:
+        start = str(
+            self._mixed_written_answer_key_path
+            or self._answer_key_path
+            or Path.home()
+        )
+        path_str, _filter = QFileDialog.getOpenFileName(
+            self,
+            "Written answer key (PDF)",
+            start,
+            "PDF files (*.pdf);;All files (*.*)",
+        )
+        if not path_str:
+            return
+        self._mixed_written_answer_key_path = Path(path_str)
+        self._mixed_written_key_label.setText(self._mixed_written_answer_key_path.name)
+
+    def _apply_mixed_row_kind(self, item: QListWidgetItem, lbl: QLabel, kind: str) -> None:
+        if kind not in ("math", "written"):
+            return
+        lbl.setText("Math" if kind == "math" else "Written")
+        item.setData(_MIXED_KIND_ROLE, kind)
+
+    def _collect_mixed_question_kinds(self) -> list[str]:
+        kinds: list[str] = []
+        for i in range(self._mixed_question_list.count()):
+            row_item = self._mixed_question_list.item(i)
+            if not row_item:
+                continue
+            k = row_item.data(_MIXED_KIND_ROLE)
+            if k in ("math", "written"):
+                kinds.append(str(k))
+        return kinds
+
     def _on_export_grades(self) -> None:
         QMessageBox.information(
             self,
@@ -1205,7 +1273,7 @@ class MainWindow(QMainWindow):
         self._status.setText("Grading…")
 
         def finish_stub() -> None:
-            # Math: CV+OCR numeric extraction. Written: keyword PDF rubric. Mixed: not wired yet.
+            # Math: CV+OCR numeric. Written: keyword rubric. Mixed: both per row kinds + optional 2nd key.
             self._progress.setRange(0, 100)
             self._progress.setValue(100)
             self._graded_list.clear()
@@ -1335,6 +1403,7 @@ class MainWindow(QMainWindow):
                             src_pdf=submission_path,
                             dst_pdf=graded_output_dir / f"graded_{text}",
                             result=result,
+                            y_offset=0.0,
                         )
                         if result.requires_manual_review:
                             append_written_response_manual_review(
@@ -1373,19 +1442,163 @@ class MainWindow(QMainWindow):
                 )
                 return
 
-            # Mixed mode: per-question routing is not implemented yet.
+            # Mixed: run math and/or written once each per submission from row kinds + dual keys.
+            self._ensure_mixed_stub_items()
+            kinds = self._collect_mixed_question_kinds()
+            need_math, need_written = mixed_needs_from_kinds(kinds)
+            if not need_math and not need_written:
+                QMessageBox.warning(self, "Run grading", "Mixed mode has no Math or Written rows configured.")
+                self._status.setText("Grading stopped: mixed question list empty.")
+                return
+            if not self._submissions_folder:
+                QMessageBox.warning(self, "Run grading", "Load a submissions folder first.")
+                self._status.setText("Grading stopped: no submissions folder loaded.")
+                return
+            if not self._answer_key_path:
+                QMessageBox.warning(self, "Run grading", "Set the primary answer key PDF (math rubric) first.")
+                self._status.setText("Grading stopped: no answer key selected.")
+                return
+
+            scoring = None
+            if need_math:
+                try:
+                    scoring = parse_answer_key_scoring(self._answer_key_path)
+                except Exception as e:
+                    QMessageBox.warning(
+                        self,
+                        "Run grading",
+                        f"Could not parse numeric math answer key (primary PDF):\n{e}",
+                    )
+                    self._status.setText("Grading stopped: math answer key parse failed.")
+                    return
+
+            written_key = None
+            written_key_path = self._mixed_written_answer_key_path or self._answer_key_path
+            if need_written:
+                try:
+                    written_key = parse_written_answer_key_pdf(written_key_path)
+                except Exception as e:
+                    QMessageBox.warning(
+                        self,
+                        "Run grading",
+                        "Could not parse written answer key. Set “Written answer key…” to a PDF with "
+                        f"'Answer keyword list:' or use a combined key.\n{e}",
+                    )
+                    self._status.setText("Grading stopped: written answer key parse failed.")
+                    return
+
+            outputs = 0
+            review_count = 0
+            grade_rows: list[tuple[str, str]] = []
+            graded_output_dir = self._submissions_folder / "graded_outputs"
+            graded_output_dir.mkdir(parents=True, exist_ok=True)
+            review_manifest = self._submissions_folder / "written_response_manual_review.txt"
+            if need_written and review_manifest.exists():
+                review_manifest.unlink()
+
             for i in range(self._submissions_list.count()):
                 item = self._submissions_list.item(i)
+                if not item:
+                    continue
                 text = item.text()
                 if text.startswith("("):
-                    # Skip informational placeholder rows.
                     continue
-                self._graded_list.addItem(QListWidgetItem(f"graded_{text}"))
-            self._low_confidence_count = min(3, max(1, self._graded_list.count()))
+                submission_path = self._submissions_folder / text
+                if not submission_path.exists():
+                    self._graded_list.addItem(QListWidgetItem(f"graded_{text} — missing file"))
+                    review_count += 1
+                    continue
+
+                final_dst = graded_output_dir / f"graded_{text}"
+                tmp_math = graded_output_dir / f"_mixed_tmp_math_{i}.pdf"
+                parts = compute_mixed_scores(
+                    submission_path,
+                    need_math=need_math,
+                    need_written=need_written,
+                    scoring=scoring,
+                    written_key=written_key,
+                )
+                review_count += parts.review_delta
+                if parts.written_result and parts.written_result.requires_manual_review:
+                    append_written_response_manual_review(
+                        review_manifest, submission_path, parts.written_result
+                    )
+
+                m_aw, m_max = parts.m_aw, parts.m_max
+                w_aw, w_max = parts.w_aw, parts.w_max
+                w_result = parts.written_result
+                extracted = parts.extracted
+                item_parts = list(parts.item_parts)
+
+                try:
+                    if extracted is not None and scoring is not None and need_math:
+                        if w_result is not None and need_written:
+                            self._write_math_annotations(
+                                src_pdf=submission_path,
+                                dst_pdf=tmp_math,
+                                extracted=extracted,
+                                awarded_points=m_aw,
+                                max_points=m_max,
+                                percent=(m_aw / m_max * 100.0) if m_max > 0 else 0.0,
+                                is_correct=abs(extracted.numeric_answer - scoring.expected_answer) < 1e-6,
+                            )
+                            self._write_written_annotations(
+                                src_pdf=tmp_math,
+                                dst_pdf=final_dst,
+                                result=w_result,
+                                y_offset=78.0,
+                            )
+                            if tmp_math.exists():
+                                tmp_math.unlink()
+                        else:
+                            self._write_math_annotations(
+                                src_pdf=submission_path,
+                                dst_pdf=final_dst,
+                                extracted=extracted,
+                                awarded_points=m_aw,
+                                max_points=m_max,
+                                percent=(m_aw / m_max * 100.0) if m_max > 0 else 0.0,
+                                is_correct=abs(extracted.numeric_answer - scoring.expected_answer) < 1e-6,
+                            )
+                    elif w_result is not None and need_written:
+                        self._write_written_annotations(
+                            src_pdf=submission_path,
+                            dst_pdf=final_dst,
+                            result=w_result,
+                            y_offset=0.0,
+                        )
+                except Exception as pe:
+                    if tmp_math.exists():
+                        tmp_math.unlink(missing_ok=True)
+                    item_parts.append(f"PDF overlay: ⚠ {pe}")
+                    review_count += 1
+
+                total_aw, total_max, pct_total = combined_total_points(m_aw, m_max, w_aw, w_max)
+                if item_parts:
+                    grade_rows.append(
+                        (self._name_from_submission_filename(text), f"{total_aw:.2f} ({pct_total:.1f}%)")
+                    )
+                    item_text = (
+                        f"graded_{text} — " + " · ".join(item_parts) + f" · combined {total_aw:.2f}/{total_max:.2f} ({pct_total:.1f}%)"
+                    )
+                    outputs += 1
+                else:
+                    item_text = f"graded_{text} — ⚠ nothing graded (check mixed row types and keys)"
+                    review_count += 1
+                self._graded_list.addItem(QListWidgetItem(item_text))
+
+            self._low_confidence_count = review_count
             self._refresh_review_banner()
+            sheet_path = self._write_grades_spreadsheet(grade_rows)
+            extra = (
+                f" Manual review list: {review_manifest.name}."
+                if need_written and review_manifest.exists()
+                else ""
+            )
             self._status.setText(
-                "Mixed mode is not wired to graders yet. Use Math or Written mode, "
-                f"or continue with this placeholder ({self._graded_list.count()} stub line(s))."
+                f"Mixed run complete. {outputs} output(s). "
+                f"{review_count} item(s) need review.{extra} "
+                f"Spreadsheet: {sheet_path.name}."
             )
 
         # Delay mimics asynchronous grading completion.
@@ -1436,6 +1649,7 @@ class MainWindow(QMainWindow):
         src_pdf: Path,
         dst_pdf: Path,
         result: WrittenResponseGradeResult,
+        y_offset: float = 0.0,
     ) -> None:
         doc = fitz.open(str(src_pdf))
         try:
@@ -1445,17 +1659,18 @@ class MainWindow(QMainWindow):
             pct = (
                 (result.points_awarded / result.max_points * 100.0) if result.max_points > 0 else 0.0
             )
+            yo = y_offset
             summary = f"{result.points_awarded:.2f}/{result.max_points:.2f} ({pct:.1f}%)"
             hits_line = f"Keywords {result.keyword_hits}/{result.keyword_total}"
             page.insert_text(
-                fitz.Point(300, 54),
+                fitz.Point(300, 54 + yo),
                 summary,
                 fontname=_GRADE_OVERLAY_FONT,
                 fontsize=17,
                 color=_GRADE_OVERLAY_RGB,
             )
             page.insert_text(
-                fitz.Point(300, 76),
+                fitz.Point(300, 76 + yo),
                 hits_line,
                 fontname=_GRADE_OVERLAY_FONT,
                 fontsize=14,
@@ -1463,7 +1678,7 @@ class MainWindow(QMainWindow):
             )
             if result.requires_manual_review:
                 page.insert_text(
-                    fitz.Point(300, 98),
+                    fitz.Point(300, 98 + yo),
                     "MANUAL REVIEW: 0 keyword hits",
                     fontname=_GRADE_OVERLAY_FONT,
                     fontsize=13,
