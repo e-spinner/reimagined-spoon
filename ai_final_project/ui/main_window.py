@@ -39,6 +39,12 @@ from ai_final_project.grading_extract import (
     parse_answer_key_scoring,
     extract_submission_numeric_answer,
 )
+from ai_final_project.written_response_grader import (
+    WrittenResponseGradeResult,
+    append_written_response_manual_review,
+    grade_written_response_pdf,
+    parse_written_answer_key_pdf,
+)
 
 # Theme strategy:
 # - Use fixed dark neutrals for the overall shell so contrast stays stable.
@@ -52,6 +58,10 @@ _THEME_TEXT = "#ffffff"
 _THEME_MUTED = "#a8a8a8"
 _LIST_HOVER_NEUTRAL = "#2c2c2c"
 SUPPORTED_SUBMISSION_SUFFIXES: tuple[str, ...] = (".pdf",)
+
+# Graded PDF overlays: bold + high-contrast red so scores read clearly on printouts.
+_GRADE_OVERLAY_RGB: tuple[float, float, float] = (0.88, 0.0, 0.05)
+_GRADE_OVERLAY_FONT: str = "hebo"  # Helvetica-Bold (PDF base-14)
 
 # Accent preset tuple order is intentionally compact because these values are
 # expanded into `AccentPalette` and used all over the stylesheet.
@@ -1195,7 +1205,7 @@ class MainWindow(QMainWindow):
         self._status.setText("Grading…")
 
         def finish_stub() -> None:
-            # Math mode now runs real CV+OCR extraction; other modes stay stubbed.
+            # Math: CV+OCR numeric extraction. Written: keyword PDF rubric. Mixed: not wired yet.
             self._progress.setRange(0, 100)
             self._progress.setValue(100)
             self._graded_list.clear()
@@ -1272,7 +1282,98 @@ class MainWindow(QMainWindow):
                 )
                 return
 
-            # Simulated outputs for written/mixed until those paths are wired.
+            if self._btn_written.isChecked():
+                if not self._submissions_folder:
+                    QMessageBox.warning(self, "Run grading", "Load a submissions folder first.")
+                    self._status.setText("Grading stopped: no submissions folder loaded.")
+                    return
+                if not self._answer_key_path:
+                    QMessageBox.warning(self, "Run grading", "Set an answer key PDF first.")
+                    self._status.setText("Grading stopped: no answer key selected.")
+                    return
+                try:
+                    written_key = parse_written_answer_key_pdf(self._answer_key_path)
+                except Exception as e:
+                    QMessageBox.warning(
+                        self,
+                        "Run grading",
+                        "Could not parse written answer key (expect 'N pts' and 'Answer keyword list:' with "
+                        f"comma-separated keywords):\n{e}",
+                    )
+                    self._status.setText("Grading stopped: written answer key parse failed.")
+                    return
+
+                outputs = 0
+                review_count = 0
+                grade_rows: list[tuple[str, str]] = []
+                graded_output_dir = self._submissions_folder / "graded_outputs"
+                graded_output_dir.mkdir(parents=True, exist_ok=True)
+                review_manifest = self._submissions_folder / "written_response_manual_review.txt"
+                if review_manifest.exists():
+                    review_manifest.unlink()
+
+                for i in range(self._submissions_list.count()):
+                    item = self._submissions_list.item(i)
+                    if not item:
+                        continue
+                    text = item.text()
+                    if text.startswith("("):
+                        continue
+                    submission_path = self._submissions_folder / text
+                    if not submission_path.exists():
+                        self._graded_list.addItem(QListWidgetItem(f"graded_{text} — missing file"))
+                        review_count += 1
+                        continue
+                    try:
+                        result = grade_written_response_pdf(submission_path, written_key)
+                        pct = (
+                            (result.points_awarded / result.max_points * 100.0)
+                            if result.max_points > 0
+                            else 0.0
+                        )
+                        self._write_written_annotations(
+                            src_pdf=submission_path,
+                            dst_pdf=graded_output_dir / f"graded_{text}",
+                            result=result,
+                        )
+                        if result.requires_manual_review:
+                            append_written_response_manual_review(
+                                review_manifest, submission_path, result
+                            )
+                            review_count += 1
+                            prefix = "⚠ 0 keywords — manual review · "
+                        else:
+                            prefix = ""
+                        item_text = (
+                            f"graded_{text} — {prefix}keywords {result.keyword_hits}/"
+                            f"{result.keyword_total} · {result.points_awarded:.2f}/"
+                            f"{result.max_points:.2f} ({pct:.1f}%)"
+                        )
+                        grade_rows.append(
+                            (self._name_from_submission_filename(text), f"{result.points_awarded:.2f} ({pct:.1f}%)")
+                        )
+                        outputs += 1
+                    except Exception as e:
+                        item_text = f"graded_{text} — ⚠ grading failed: {e}"
+                        review_count += 1
+                    self._graded_list.addItem(QListWidgetItem(item_text))
+
+                self._low_confidence_count = review_count
+                self._refresh_review_banner()
+                sheet_path = self._write_grades_spreadsheet(grade_rows)
+                extra = (
+                    f" Manual review list: {review_manifest.name}."
+                    if review_manifest.exists()
+                    else ""
+                )
+                self._status.setText(
+                    f"Written run complete. {outputs} output(s). "
+                    f"{review_count} item(s) need review.{extra} "
+                    f"Spreadsheet: {sheet_path.name}."
+                )
+                return
+
+            # Mixed mode: per-question routing is not implemented yet.
             for i in range(self._submissions_list.count()):
                 item = self._submissions_list.item(i)
                 text = item.text()
@@ -1283,9 +1384,8 @@ class MainWindow(QMainWindow):
             self._low_confidence_count = min(3, max(1, self._graded_list.count()))
             self._refresh_review_banner()
             self._status.setText(
-                f"Stub run complete ({'Written' if self._btn_written.isChecked() else 'Mixed'} mode). "
-                f"{self._graded_list.count()} output(s). "
-                f"{self._low_confidence_count} low-confidence — review before export."
+                "Mixed mode is not wired to graders yet. Use Math or Written mode, "
+                f"or continue with this placeholder ({self._graded_list.count()} stub line(s))."
             )
 
         # Delay mimics asynchronous grading completion.
@@ -1310,22 +1410,65 @@ class MainWindow(QMainWindow):
             answer = extracted.detection.answer_box
             # Use ASCII "X" for incorrect marks so text extraction remains reliable.
             symbol = "✓" if is_correct else "X"
-            color = (0.1, 0.65, 0.2) if is_correct else (0.82, 0.15, 0.15)
-            # Place check/x near the detected answer box.
+            # Thick red mark + score line (requested visibility on returned PDFs).
             page.insert_text(
-                fitz.Point(answer.x + answer.w + 8, answer.y + 16),
+                fitz.Point(answer.x + answer.w + 8, answer.y + 20),
                 symbol,
-                fontsize=18,
-                color=color,
+                fontname=_GRADE_OVERLAY_FONT,
+                fontsize=22,
+                color=_GRADE_OVERLAY_RGB,
             )
-            # Put score summary near top-right area of first page.
             summary = f"{awarded_points:.2f}/{max_points:.2f}  ({percent:.1f}%)"
             page.insert_text(
-                fitz.Point(380, 56),
+                fitz.Point(360, 58),
                 summary,
-                fontsize=12,
-                color=(0.15, 0.15, 0.15),
+                fontname=_GRADE_OVERLAY_FONT,
+                fontsize=17,
+                color=_GRADE_OVERLAY_RGB,
             )
+            doc.save(str(dst_pdf))
+        finally:
+            doc.close()
+
+    def _write_written_annotations(
+        self,
+        *,
+        src_pdf: Path,
+        dst_pdf: Path,
+        result: WrittenResponseGradeResult,
+    ) -> None:
+        doc = fitz.open(str(src_pdf))
+        try:
+            if len(doc) == 0:
+                return
+            page = doc[0]
+            pct = (
+                (result.points_awarded / result.max_points * 100.0) if result.max_points > 0 else 0.0
+            )
+            summary = f"{result.points_awarded:.2f}/{result.max_points:.2f} ({pct:.1f}%)"
+            hits_line = f"Keywords {result.keyword_hits}/{result.keyword_total}"
+            page.insert_text(
+                fitz.Point(300, 54),
+                summary,
+                fontname=_GRADE_OVERLAY_FONT,
+                fontsize=17,
+                color=_GRADE_OVERLAY_RGB,
+            )
+            page.insert_text(
+                fitz.Point(300, 76),
+                hits_line,
+                fontname=_GRADE_OVERLAY_FONT,
+                fontsize=14,
+                color=_GRADE_OVERLAY_RGB,
+            )
+            if result.requires_manual_review:
+                page.insert_text(
+                    fitz.Point(300, 98),
+                    "MANUAL REVIEW: 0 keyword hits",
+                    fontname=_GRADE_OVERLAY_FONT,
+                    fontsize=13,
+                    color=_GRADE_OVERLAY_RGB,
+                )
             doc.save(str(dst_pdf))
         finally:
             doc.close()
