@@ -45,3 +45,24 @@ The full suite expects the **`ocr-ensemble`** extra, because tests exercise OCR 
 
 - **GPU / CUDA warnings**  
   OCR stacks may warn if CUDA is unavailable; CPU mode is normal for this project.
+
+## `ai_final_project` package layout
+
+The Python package under `ai_final_project/` is organized by responsibility: entrypoints and GUI at the top level, grading pipelines beside them, and OCR behind a small subpackage.
+
+| Location | Purpose |
+|----------|---------|
+| `__init__.py` | Package metadata (`__version__`). |
+| `__main__.py` | `python -m ai_final_project` delegates to `main.main()`. |
+| `main.py` | Starts the Qt application and shows `MainWindow`. |
+| `roster.py` | Reads student names from roster spreadsheets (`.xlsx` / `.ods`, first column). |
+| `cv_boxes.py` | OpenCV + PyMuPDF helpers to find answer regions on rendered PDF pages (boxes, crops, PDF coordinate mapping). |
+| `grading_extract.py` | Numeric-answer pipeline: answer-key parsing, submission crops, OCR-backed number extraction and scoring structs. |
+| `written_response_grader.py` | Written answers: parse keyword rubrics from answer-key PDFs, extract submission text, score by keyword overlap, flag manual review. |
+| `mixed_grading.py` | Combines math (numeric) and written grading for one submission; shared logic for the UI and tests. |
+| `ocr/types.py` | Shared OCR datatypes (`OCRTask`, `OCRPrediction`, `OCRResult`). |
+| `ocr/engines.py` | Pluggable OCR backends (EasyOCR, docTR, PaddleOCR, etc.) with lazy imports and env/cache hooks. |
+| `ocr/ensemble.py` | Runs multiple engines per task, merges predictions, and surfaces confidence / review hints. |
+| `ocr/__init__.py` | Public OCR API re-exports (`OCREnsemble`, `default_engines`, errors, types). |
+| `ui/__init__.py` | UI subpackage marker. |
+| `ui/main_window.py` | PySide6 main window: file picking, grading runs, progress, PDF markup export, and review workflow. |
