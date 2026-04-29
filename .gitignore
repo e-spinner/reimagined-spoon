@@ -1,3 +1,36 @@
+# Virtual environments
 .venv/
+venv/
+env/
 
+# Python
 **/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# OCR / ML caches and downloaded weights (see ai_final_project/ocr/engines.py)
+.cache/
+/doctr/
+easyocr_local_cache/
+
+# Tests & tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Generated test artifacts
+Unit Tests/output/
+
+# OS
+.DS_Store
+Thumbs.db
