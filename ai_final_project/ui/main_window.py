@@ -2,12 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import csv
+import os
+import re
+import shutil
+import tempfile
 
-from PySide6.QtCore import QSize, Qt, QTimer, QSettings
-from PySide6.QtGui import QAction, QColor, QFont
+import fitz
+from PySide6.QtCore import QSize, Qt, QTimer, QSettings, QByteArray
+from PySide6.QtGui import QAction, QColor, QFont, QImage, QPixmap
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QColorDialog,
     QDialog,
     QDialogButtonBox,
@@ -24,6 +31,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QSpinBox,
     QStyle,
@@ -32,7 +40,24 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ai_final_project.cv_boxes import answer_box_rect_to_pdf_rect
 from ai_final_project.roster import read_student_names
+from ai_final_project.grading_extract import (
+    parse_answer_key_scoring,
+    extract_submission_numeric_answer,
+)
+from ai_final_project.mixed_grading import (
+    combined_total_points,
+    compute_mixed_scores,
+    mixed_needs_from_kinds,
+)
+from ai_final_project.written_response_grader import (
+    WrittenResponseGradeResult,
+    append_written_response_manual_review,
+    apply_matched_keyword_highlights,
+    grade_written_response_pdf,
+    parse_written_answer_key_pdf,
+)
 
 # Theme strategy:
 # - Use fixed dark neutrals for the overall shell so contrast stays stable.
@@ -45,6 +70,14 @@ _THEME_CARD_DEEP = "#181818"
 _THEME_TEXT = "#ffffff"
 _THEME_MUTED = "#a8a8a8"
 _LIST_HOVER_NEUTRAL = "#2c2c2c"
+SUPPORTED_SUBMISSION_SUFFIXES: tuple[str, ...] = (".pdf",)
+
+# Graded PDF overlays: bold + high-contrast red so scores read clearly on printouts.
+_GRADE_OVERLAY_RGB: tuple[float, float, float] = (0.88, 0.0, 0.05)
+_GRADE_OVERLAY_FONT: str = "hebo"  # Helvetica-Bold (PDF base-14)
+
+# QListWidgetItem data for mixed-mode rows: "math" | "written"
+_MIXED_KIND_ROLE = int(Qt.ItemDataRole.UserRole) + 37
 
 # Accent preset tuple order is intentionally compact because these values are
 # expanded into `AccentPalette` and used all over the stylesheet.
@@ -73,6 +106,84 @@ class AccentPalette:
     fill_active: str
     # List-row hover color (kept neutral to avoid visual noise).
     list_hover: str
+
+
+@dataclass(frozen=True)
+class ParsedPdfInfo:
+    path: Path
+    page_count: int
+    question_count: int
+    total_points: int
+
+
+@dataclass(frozen=True)
+class ParsedSubmissionFolder:
+    pdf_files: list[Path]
+    unsupported_files: list[Path]
+    unsupported_manifest: Path | None
+
+
+def _extract_pdf_text_local(pdf_path: Path) -> str:
+    """Extract text from a PDF using local-only dependency if available."""
+    try:
+        from pypdf import PdfReader
+    except Exception as e:
+        raise RuntimeError(
+            "PDF parsing requires local package 'pypdf'. Install with: pip install pypdf"
+        ) from e
+
+    reader = PdfReader(str(pdf_path))
+    chunks: list[str] = []
+    for page in reader.pages:
+        try:
+            chunks.append(page.extract_text() or "")
+        except Exception:
+            # Keep parser resilient to per-page extraction failures.
+            chunks.append("")
+    return "\n".join(chunks)
+
+
+def parse_answer_key_pdf(pdf_path: Path) -> ParsedPdfInfo:
+    text = _extract_pdf_text_local(pdf_path)
+    # Lightweight heuristics until a formal rubric parser exists.
+    question_hits = len(
+        re.findall(r"\b(?:question|q)\s*[\.:#-]?\s*\d+\b", text, flags=re.IGNORECASE)
+    )
+    points = [int(m) for m in re.findall(r"\b(\d{1,3})\s*(?:points?|pts?)\b", text, flags=re.IGNORECASE)]
+    total_points = sum(points)
+    try:
+        from pypdf import PdfReader
+
+        page_count = len(PdfReader(str(pdf_path)).pages)
+    except Exception:
+        page_count = 0
+    return ParsedPdfInfo(
+        path=pdf_path,
+        page_count=page_count,
+        question_count=question_hits,
+        total_points=total_points,
+    )
+
+
+def parse_submissions_folder(folder: Path) -> ParsedSubmissionFolder:
+    entries = sorted([p for p in folder.iterdir() if p.is_file()], key=lambda p: p.name.lower())
+    pdfs = [p for p in entries if p.suffix.lower() in SUPPORTED_SUBMISSION_SUFFIXES]
+    unsupported = [p for p in entries if p.suffix.lower() not in SUPPORTED_SUBMISSION_SUFFIXES]
+    manifest: Path | None = None
+    if unsupported:
+        manifest = folder / "unsupported_files_for_review.txt"
+        lines = [
+            "Unsupported files found during submission import:",
+            "",
+        ]
+        for p in unsupported:
+            lines.append(f"- {p.name}")
+        manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return ParsedSubmissionFolder(
+        pdf_files=pdfs,
+        unsupported_files=unsupported,
+        unsupported_manifest=manifest,
+    )
 
 
 def accent_palette_from_preset(key: str) -> AccentPalette:
@@ -216,6 +327,10 @@ QLabel#PreviewPane {{
     border: 2px solid {a.border};
     border-radius: 14px;
     padding: 12px;
+}}
+QScrollArea#previewScroll {{
+    border: none;
+    background: transparent;
 }}
 QLabel#sideLogo {{
     font-weight: 800;
@@ -459,6 +574,148 @@ class ThemeSettingsDialog(QDialog):
         self._mw._status.setText(f"Theme accent: custom ({hex_name}).")
 
 
+@dataclass(frozen=True)
+class ExportGradesOptions:
+    folder: Path
+    write_spreadsheet: bool
+    spreadsheet_filename: str
+    spreadsheet_format: str
+    copy_graded_pdfs: bool
+
+
+class ExportGradesDialog(QDialog):
+    """Pick export folder and which artifacts to write (spreadsheet + graded PDFs)."""
+
+    def __init__(self, parent: MainWindow, *, default_folder: Path) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Export grades")
+        self.setMinimumWidth(440)
+        self._result: ExportGradesOptions | None = None
+
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+        intro = QLabel(
+            "Choose where to save the grade book and/or copies of marked PDFs. "
+            "Spreadsheet columns follow “Run grading”: Name and Grade when no roster merge applies.",
+            self,
+        )
+        intro.setWordWrap(True)
+        intro.setObjectName("CaptionMuted")
+        root.addWidget(intro)
+
+        folder_row = QWidget(self)
+        fr = QHBoxLayout(folder_row)
+        fr.setContentsMargins(0, 0, 0, 0)
+        self._folder_edit = QLineEdit(str(default_folder), self)
+        self._folder_edit.setObjectName("titleField")
+        browse = QPushButton("Browse…", self)
+        browse.setObjectName("actionBtn")
+        browse.clicked.connect(self._browse_folder)
+        fr.addWidget(self._folder_edit, stretch=1)
+        fr.addWidget(browse, stretch=0)
+        root.addWidget(folder_row)
+
+        self._chk_sheet = QCheckBox("Export spreadsheet (CSV or XLSX)", self)
+        self._chk_sheet.setChecked(True)
+        root.addWidget(self._chk_sheet)
+
+        name_row = QWidget(self)
+        nr = QHBoxLayout(name_row)
+        nr.setContentsMargins(0, 0, 0, 0)
+        nr.addWidget(QLabel("Spreadsheet file name:", self))
+        self._name_edit = QLineEdit("grades_export.xlsx", self)
+        self._name_edit.setObjectName("titleField")
+        nr.addWidget(self._name_edit, stretch=1)
+        root.addWidget(name_row)
+
+        fmt_row = QWidget(self)
+        fr2 = QHBoxLayout(fmt_row)
+        fr2.setContentsMargins(0, 0, 0, 0)
+        fr2.addWidget(QLabel("Spreadsheet format:", self))
+        self._format_combo = QComboBox(self)
+        self._format_combo.addItem("Excel (.xlsx)", "xlsx")
+        self._format_combo.addItem("CSV (.csv)", "csv")
+        self._format_combo.currentIndexChanged.connect(self._sync_filename_extension)
+        fr2.addWidget(self._format_combo, stretch=1)
+        root.addWidget(fmt_row)
+
+        self._chk_pdfs = QCheckBox("Copy marked PDFs from this batch (graded_*.pdf)", self)
+        self._chk_pdfs.setChecked(True)
+        root.addWidget(self._chk_pdfs)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Save
+        )
+        bb.accepted.connect(self._accept)
+        bb.rejected.connect(self.reject)
+        root.addWidget(bb)
+
+    def _browse_folder(self) -> None:
+        d = QFileDialog.getExistingDirectory(
+            self,
+            "Export folder",
+            self._folder_edit.text() or str(Path.home()),
+        )
+        if d:
+            self._folder_edit.setText(d)
+
+    def _accept(self) -> None:
+        raw = self._folder_edit.text().strip()
+        if not raw:
+            QMessageBox.warning(self, "Export grades", "Choose an export folder.")
+            return
+        folder = Path(raw).expanduser()
+        if not folder.is_dir():
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                QMessageBox.warning(self, "Export grades", f"Cannot create folder:\n{e}")
+                return
+
+        fmt = str(self._format_combo.currentData() or "xlsx")
+        name = self._name_edit.text().strip() or ("grades_export.csv" if fmt == "csv" else "grades_export.xlsx")
+        if fmt == "csv":
+            if not name.lower().endswith(".csv"):
+                name = f"{name}.csv"
+        elif not name.lower().endswith((".xlsx", ".xlsm")):
+            name = f"{name}.xlsx"
+
+        if not self._chk_sheet.isChecked() and not self._chk_pdfs.isChecked():
+            QMessageBox.warning(
+                self,
+                "Export grades",
+                "Select at least one export: spreadsheet and/or marked PDFs.",
+            )
+            return
+
+        self._result = ExportGradesOptions(
+            folder=folder,
+            write_spreadsheet=self._chk_sheet.isChecked(),
+            spreadsheet_filename=name,
+            spreadsheet_format=fmt,
+            copy_graded_pdfs=self._chk_pdfs.isChecked(),
+        )
+        self.accept()
+
+    def options(self) -> ExportGradesOptions | None:
+        return self._result
+
+    def _sync_filename_extension(self) -> None:
+        current = self._name_edit.text().strip()
+        if not current:
+            self._name_edit.setText(
+                "grades_export.csv"
+                if str(self._format_combo.currentData() or "xlsx") == "csv"
+                else "grades_export.xlsx"
+            )
+            return
+        if str(self._format_combo.currentData() or "xlsx") == "csv":
+            if current.lower().endswith((".xlsx", ".xlsm")):
+                self._name_edit.setText(Path(current).with_suffix(".csv").name)
+        elif current.lower().endswith(".csv"):
+            self._name_edit.setText(Path(current).with_suffix(".xlsx").name)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -466,11 +723,22 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1020, 640)
 
         self._answer_key_path: Path | None = None
+        self._answer_key_info: ParsedPdfInfo | None = None
+        # Mixed mode: optional separate PDF for keyword written rubric (math uses primary key).
+        self._mixed_written_answer_key_path: Path | None = None
         self._submissions_folder: Path | None = None
         # Number of items requiring manual review after a grading run.
         self._low_confidence_count: int = 0
         # Imported names from roster spreadsheet, used for quick sanity checks.
         self._roster_names: list[str] = []
+        self._roster_path: Path | None = None
+        # Last “Run grading” summary rows for Export; cleared on new folder load optional — keep until next run.
+        self._last_grade_rows: list[tuple[str, str]] | None = None
+        # Keep generated outputs out of the submissions folder until explicit export.
+        self._work_output_dir = (
+            Path(tempfile.gettempdir()) / "homework_grader" / f"session_{os.getpid()}"
+        )
+        self._work_output_dir.mkdir(parents=True, exist_ok=True)
         self._accent, self._accent_preset_key = load_saved_accent_palette()
 
         self._build_actions()
@@ -504,7 +772,7 @@ class MainWindow(QMainWindow):
         self._act_export.triggered.connect(self._on_export_grades)
         self._act_roster = QAction("Import roster (Excel or Calc)…", self)
         self._act_roster.triggered.connect(self._on_import_roster)
-        self._act_run_grade = QAction("Run grading (stub)…", self)
+        self._act_run_grade = QAction("Run grading!", self)
         self._act_run_grade.triggered.connect(self._on_run_grading_stub)
         self._act_theme = QAction("Theme & accent color…", self)
         self._act_theme.setStatusTip("Highlight color for borders and controls (presets or custom).")
@@ -535,50 +803,50 @@ class MainWindow(QMainWindow):
         outer.setSpacing(14)
 
         # --- Icon sidebar (dashboard style) ---
-        side = QFrame(self)
-        side.setObjectName("sideBar")
-        side_v = QVBoxLayout(side)
-        side_v.setContentsMargins(8, 14, 8, 14)
-        side_v.setSpacing(10)
+        # side = QFrame(self)
+        # side.setObjectName("sideBar")
+        # side_v = QVBoxLayout(side)
+        # side_v.setContentsMargins(8, 14, 8, 14)
+        # side_v.setSpacing(10)
 
-        logo = QLabel("HG", self)
-        logo.setObjectName("sideLogo")
-        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # logo = QLabel("HG", self)
+        # logo.setObjectName("sideLogo")
+        # logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self._btn_side_home = self._make_side_nav_button(
-            QStyle.StandardPixmap.SP_DirHomeIcon, "Workspace overview", checkable=True
-        )
-        self._btn_side_home.setChecked(True)
-        self._btn_side_review = self._make_side_nav_button(
-            QStyle.StandardPixmap.SP_MessageBoxWarning, "Review queue (placeholder)", checkable=False
-        )
-        self._btn_side_review.clicked.connect(self._on_review_placeholder)
+        # self._btn_side_home = self._make_side_nav_button(
+        #     QStyle.StandardPixmap.SP_DirHomeIcon, "Workspace overview", checkable=True
+        # )
+        # self._btn_side_home.setChecked(True)
+        # self._btn_side_review = self._make_side_nav_button(
+        #     QStyle.StandardPixmap.SP_MessageBoxWarning, "Review queue (placeholder)", checkable=False
+        # )
+        # self._btn_side_review.clicked.connect(self._on_review_placeholder)
 
-        self._btn_side_settings = QToolButton(self)
-        self._btn_side_settings.setObjectName("sideNavBtn")
-        self._btn_side_settings.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogInfoView))
-        self._btn_side_settings.setIconSize(QSize(22, 22))
-        self._btn_side_settings.setToolTip("Menu")
-        self._btn_side_settings.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        m = QMenu(self)
-        # Surface the same QAction objects used elsewhere for one source of truth.
-        m.addAction(self._act_answer_key)
-        m.addAction(self._act_export)
-        m.addAction(self._act_roster)
-        m.addSeparator()
-        m.addAction(self._act_run_grade)
-        m.addSeparator()
-        m.addAction(self._act_theme)
-        m.addSeparator()
-        m.addAction(self._act_quit)
-        self._btn_side_settings.setMenu(m)
+        # self._btn_side_settings = QToolButton(self)
+        # self._btn_side_settings.setObjectName("sideNavBtn")
+        # self._btn_side_settings.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogInfoView))
+        # self._btn_side_settings.setIconSize(QSize(22, 22))
+        # self._btn_side_settings.setToolTip("Menu")
+        # self._btn_side_settings.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        # m = QMenu(self)
+        # # Surface the same QAction objects used elsewhere for one source of truth.
+        # m.addAction(self._act_answer_key)
+        # m.addAction(self._act_export)
+        # m.addAction(self._act_roster)
+        # m.addSeparator()
+        # m.addAction(self._act_run_grade)
+        # m.addSeparator()
+        # m.addAction(self._act_theme)
+        # m.addSeparator()
+        # m.addAction(self._act_quit)
+        # self._btn_side_settings.setMenu(m)
 
-        side_v.addWidget(logo)
-        side_v.addWidget(self._btn_side_home)
-        side_v.addWidget(self._btn_side_review)
-        side_v.addStretch(1)
-        side_v.addWidget(self._btn_side_settings)
-        outer.addWidget(side)
+        # side_v.addWidget(logo)
+        # side_v.addWidget(self._btn_side_home)
+        # side_v.addWidget(self._btn_side_review)
+        # side_v.addStretch(1)
+        # side_v.addWidget(self._btn_side_settings)
+        # outer.addWidget(side)
 
         # --- Main column: header + body card ---
         main_col = QWidget(self)
@@ -622,7 +890,7 @@ class MainWindow(QMainWindow):
         body_l.setContentsMargins(14, 14, 14, 14)
         body_l.setSpacing(14)
 
-        # --- Left: workflow nav (like DEVICES column) ---
+        # --- Left: supporting nav column ---
         nav = QFrame(self)
         nav.setObjectName("navColumn")
         nav.setMinimumWidth(200)
@@ -631,8 +899,14 @@ class MainWindow(QMainWindow):
         nav_v.setContentsMargins(12, 12, 12, 12)
         nav_v.setSpacing(10)
 
-        cap_work = QLabel("WORKFLOW", self)
-        cap_work.setObjectName("CaptionMuted")
+        cap_nav = QLabel("INFO", self)
+        cap_nav.setObjectName("CaptionMuted")
+        nav_hint = QLabel(
+            "Use the right-side panel for question type selection and grading workflow actions.",
+            self,
+        )
+        nav_hint.setObjectName("CaptionMuted")
+        nav_hint.setWordWrap(True)
 
         self._btn_math = QToolButton(self)
         self._btn_math.setObjectName("modeNavBtn")
@@ -646,21 +920,21 @@ class MainWindow(QMainWindow):
         self._btn_written.setCheckable(True)
         self._btn_written.setToolTip("Short answers and prose-style responses (PDF).")
 
-        self._btn_mixed = QToolButton(self)
-        self._btn_mixed.setObjectName("modeNavBtn")
-        self._btn_mixed.setText("  Mixed (per question)")
-        self._btn_mixed.setCheckable(True)
-        self._btn_mixed.setToolTip(
-            "Same assignment uses math-style grading for some questions and written-style for others. "
-            "Define which below (stub list until the answer key is linked)."
-        )
+        # self._btn_mixed = QToolButton(self)
+        # self._btn_mixed.setObjectName("modeNavBtn")
+        # self._btn_mixed.setText("  Mixed (per question)")
+        # self._btn_mixed.setCheckable(True)
+        # self._btn_mixed.setToolTip(
+        #     "Runs the built-in math grader for rows marked Math and the keyword written grader for "
+        #     "rows marked Written. Primary answer key = math rubric; set a written key if needed."
+        # )
 
         self._mode_group = QButtonGroup(self)
         self._mode_group.setExclusive(True)
         # Exactly one grading mode should be active at a time.
         self._mode_group.addButton(self._btn_math)
         self._mode_group.addButton(self._btn_written)
-        self._mode_group.addButton(self._btn_mixed)
+        # self._mode_group.addButton(self._btn_mixed)
         self._mode_group.idClicked.connect(self._on_mode_changed)
 
         self._mixed_section = QFrame(self)
@@ -673,42 +947,45 @@ class MainWindow(QMainWindow):
         cap_mix = QLabel("PER-QUESTION TYPES", self)
         cap_mix.setObjectName("CaptionMuted")
         hint_mix = QLabel(
-            "Each question can be marked Math or Written. "
-            "The grader will use the right model per item.",
-            self,
+            "Each row sets whether that slot uses the math (numeric/OCR) or written (keyword) grader. "
+            "If both appear, both graders run once each and scores are combined on the output PDF."
         )
         hint_mix.setObjectName("mixedHint")
         hint_mix.setWordWrap(True)
+        written_key_row = QWidget(self)
+        written_key_l = QHBoxLayout(written_key_row)
+        written_key_l.setContentsMargins(0, 0, 0, 0)
+        written_key_l.setSpacing(8)
+        self._btn_mixed_written_key = QPushButton("Written answer key…", self)
+        self._btn_mixed_written_key.setObjectName("actionBtn")
+        self._btn_mixed_written_key.setToolTip(
+            "PDF with points and 'Answer keyword list:' (same format as Written-only mode). "
+            "Leave unset to try the primary answer key."
+        )
+        self._btn_mixed_written_key.clicked.connect(self._on_set_mixed_written_answer_key)
+        self._mixed_written_key_label = QLabel("(using primary answer key)", self)
+        self._mixed_written_key_label.setObjectName("CaptionMuted")
+        self._mixed_written_key_label.setWordWrap(True)
+        written_key_l.addWidget(self._btn_mixed_written_key, stretch=0)
+        written_key_l.addWidget(self._mixed_written_key_label, stretch=1)
         self._mixed_question_list = QListWidget(self)
-        # Placeholder until rubric/question extraction from answer key is wired.
         self._mixed_question_list.setToolTip(
-            "Example layout: final app will read rubric sections from your answer key PDF."
+            "Use the row menu (☰) to switch each question between Math and Written."
         )
         mixed_l.addWidget(cap_mix)
         mixed_l.addWidget(hint_mix)
+        mixed_l.addWidget(written_key_row)
         mixed_l.addWidget(self._mixed_question_list, stretch=1)
 
         self._btn_load_folder = QPushButton("Load submissions folder", self)
         self._btn_load_folder.setObjectName("actionBtn")
         self._btn_load_folder.clicked.connect(self._on_load_submissions_folder)
 
-        self._btn_train = QPushButton("Handwriting training", self)
-        self._btn_train.setObjectName("actionBtn")
-        self._btn_train.setToolTip(
-            "Per-student samples (~100 per symbol). Target ≥80% accuracy; ensemble preferred."
-        )
-        self._btn_train.clicked.connect(self._on_handwriting_training)
-
-        nav_v.addWidget(cap_work)
-        nav_v.addWidget(self._btn_math)
-        nav_v.addWidget(self._btn_written)
-        nav_v.addWidget(self._btn_mixed)
-        nav_v.addWidget(self._mixed_section, stretch=1)
-        nav_v.addSpacing(6)
-        nav_v.addWidget(self._btn_load_folder)
-        nav_v.addWidget(self._btn_train)
-        nav_v.addStretch(1)
-        body_l.addWidget(nav)
+        nav_v.addWidget(cap_nav)
+        nav_v.addWidget(nav_hint)
+        # Temporarily hide the left panel while the streamlined right-side
+        # workflow is being used.
+        nav.setVisible(False)
 
         # --- Center: dual panes in splitter ---
         center = QFrame(self)
@@ -751,20 +1028,45 @@ class MainWindow(QMainWindow):
         rh = QLabel("Graded outputs", self)
         rh.setObjectName("SectionTitle")
         self._graded_list = QListWidget(self)
-        # Preview panel is text-only placeholder until PDF rendering is integrated.
         self._graded_list.currentItemChanged.connect(self._on_graded_changed)
-        self._preview_label = QLabel(
-            "Select a graded output to preview.\n\n"
-            "Graded PDFs will show score / max points, percentage, and ✓ / ✗ marks.",
-            self,
-        )
-        self._preview_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self._preview_label.setWordWrap(True)
-        self._preview_label.setMinimumHeight(100)
-        self._preview_label.setObjectName("PreviewPane")
+        cap_prev = QLabel("PAGE 1 PREVIEW", self)
+        cap_prev.setObjectName("CaptionMuted")
+        prev_row = QWidget(self)
+        prev_h = QHBoxLayout(prev_row)
+        prev_h.setContentsMargins(0, 0, 0, 0)
+        prev_h.setSpacing(8)
+
+        def _make_pdf_preview_column(title: str) -> tuple[QWidget, QLabel]:
+            box = QVBoxLayout()
+            box.setContentsMargins(0, 0, 0, 0)
+            box.setSpacing(4)
+            lt = QLabel(title, self)
+            lt.setObjectName("SectionTitle")
+            scroll = QScrollArea(self)
+            scroll.setWidgetResizable(True)
+            scroll.setObjectName("previewScroll")
+            scroll.setMinimumHeight(400)
+            inner = QLabel(self)
+            inner.setObjectName("PreviewPane")
+            inner.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+            inner.setWordWrap(True)
+            inner.setText("—")
+            scroll.setWidget(inner)
+            box.addWidget(lt)
+            box.addWidget(scroll, stretch=1)
+            w = QWidget(self)
+            w.setLayout(box)
+            return w, inner
+
+        orig_col, self._preview_orig_label = _make_pdf_preview_column("Original submission")
+        graded_col, self._preview_graded_label = _make_pdf_preview_column("Graded (with marks)")
+        prev_h.addWidget(orig_col, stretch=1)
+        prev_h.addWidget(graded_col, stretch=1)
+
         out_l.addWidget(rh)
         out_l.addWidget(self._graded_list, stretch=1)
-        out_l.addWidget(self._preview_label, stretch=0)
+        out_l.addWidget(cap_prev)
+        out_l.addWidget(prev_row, stretch=0)
 
         splitter.addWidget(sub_card)
         splitter.addWidget(out_card)
@@ -786,8 +1088,12 @@ class MainWindow(QMainWindow):
         cmd_v.setContentsMargins(12, 12, 12, 12)
         cmd_v.setSpacing(12)
 
-        cap_cmd = QLabel("QUICK ACTIONS", self)
-        cap_cmd.setObjectName("CaptionMuted")
+        # cap_cmd = QLabel("QUICK ACTIONS", self)
+        # cap_cmd.setObjectName("CaptionMuted")
+        cap_qtype = QLabel("QUESTION TYPE", self)
+        cap_qtype.setObjectName("CaptionMuted")
+        cap_flow = QLabel("WORKFLOW", self)
+        cap_flow.setObjectName("CaptionMuted")
 
         cap_roster = QLabel("ROSTER", self)
         cap_roster.setObjectName("CaptionMuted")
@@ -832,7 +1138,7 @@ class MainWindow(QMainWindow):
         f.setPointSize(max(9, f.pointSize()))
         self._status.setFont(f)
 
-        self._btn_answer = QPushButton("Answer key (PDF)", self)
+        self._btn_answer = QPushButton("Load Answer key", self)
         self._btn_answer.setObjectName("primaryAccentBtn")
         self._btn_answer.clicked.connect(self._on_set_answer_key)
 
@@ -840,7 +1146,7 @@ class MainWindow(QMainWindow):
         self._btn_export.setObjectName("actionBtn")
         self._btn_export.clicked.connect(self._on_export_grades)
 
-        self._btn_grade = QPushButton("Run grading (stub)", self)
+        self._btn_grade = QPushButton("Run grading", self)
         self._btn_grade.setObjectName("actionBtn")
         self._btn_grade.clicked.connect(self._on_run_grading_stub)
 
@@ -849,24 +1155,38 @@ class MainWindow(QMainWindow):
         self._chk_alerts.setToolTip("When on, the banner highlights items needing human review.")
         self._chk_alerts.toggled.connect(lambda _c: self._refresh_review_banner())
 
-        cmd_v.addWidget(cap_cmd)
-        cmd_v.addWidget(cap_roster)
-        cmd_v.addWidget(cap_expected)
-        cmd_v.addWidget(self._spin_expected)
-        cmd_v.addWidget(self._btn_roster_import)
-        cmd_v.addWidget(self._roster_summary)
-        cmd_v.addSpacing(8)
-        cmd_v.addWidget(cap_file)
-        cmd_v.addWidget(self._title_edit)
+        # cmd_v.addWidget(cap_cmd)
+        cmd_v.addWidget(cap_qtype)
+        cmd_v.addWidget(self._btn_math)
+        cmd_v.addWidget(self._btn_written)
+        # cmd_v.addWidget(self._btn_mixed)
+        # cmd_v.addWidget(self._mixed_section, stretch=0)
+        cmd_v.addSpacing(4)
+        cmd_v.addWidget(cap_flow)
+        cmd_v.addWidget(self._btn_answer)
+        cmd_v.addWidget(self._btn_load_folder)
+        cmd_v.addWidget(self._btn_grade)
         cmd_v.addWidget(cap_prog)
         cmd_v.addWidget(self._progress)
-        cmd_v.addWidget(self._status)
-        cmd_v.addWidget(self._btn_answer)
         cmd_v.addWidget(self._btn_export)
-        cmd_v.addWidget(self._btn_grade)
-        cmd_v.addWidget(self._chk_alerts)
+        cmd_v.addSpacing(4)
+        cmd_v.addWidget(self._status)
         cmd_v.addStretch(1)
         body_l.addWidget(cmd)
+
+        # Keep only question-type + workflow actions on the right.
+        # Move supporting controls to the left column.
+        nav_v.addSpacing(8)
+        nav_v.addWidget(cap_roster)
+        nav_v.addWidget(cap_expected)
+        nav_v.addWidget(self._spin_expected)
+        nav_v.addWidget(self._btn_roster_import)
+        nav_v.addWidget(self._roster_summary)
+        nav_v.addSpacing(8)
+        nav_v.addWidget(cap_file)
+        nav_v.addWidget(self._title_edit)
+        nav_v.addWidget(self._chk_alerts)
+        nav_v.addStretch(1)
 
         main_v.addWidget(header)
         main_v.addWidget(body, stretch=1)
@@ -952,28 +1272,71 @@ class MainWindow(QMainWindow):
             )
             return
         self._roster_names = names
+        self._roster_path = roster_path
         self._update_roster_summary()
         self._status.setText(f"Roster loaded: {len(names)} student name(s) from “{roster_path.name}”.")
 
     def _sync_mixed_section(self) -> None:
-        mixed = self._btn_mixed.isChecked()
+        # mixed = self._btn_mixed.isChecked()
+        mixed = False
         self._mixed_section.setVisible(mixed)
         if mixed:
-            # Seed demo rows once until question extraction from the answer key exists.
             self._ensure_mixed_stub_items()
+            if self._mixed_written_answer_key_path:
+                self._mixed_written_key_label.setText(self._mixed_written_answer_key_path.name)
+            else:
+                self._mixed_written_key_label.setText("(using primary answer key)")
 
     def _ensure_mixed_stub_items(self) -> None:
         # Populate once so toggling in/out of mixed mode does not duplicate rows.
         if self._mixed_question_list.count() > 0:
             return
         examples = [
-            "Question 1 — Math",
-            "Question 2 — Written",
-            "Question 3 — Math",
-            "Question 4 — Written",
+            ("Question 1", "Math"),
+            ("Question 2", "Written"),
+            ("Question 3", "Math"),
+            ("Question 4", "Written"),
         ]
-        for line in examples:
-            self._mixed_question_list.addItem(QListWidgetItem(line))
+        for question_label, selected_kind in examples:
+            item = QListWidgetItem(self._mixed_question_list)
+            kind = "math" if selected_kind == "Math" else "written"
+            item.setData(_MIXED_KIND_ROLE, kind)
+            row = QWidget(self._mixed_question_list)
+            row_l = QHBoxLayout(row)
+            row_l.setContentsMargins(8, 6, 8, 6)
+            row_l.setSpacing(10)
+
+            label = QLabel(question_label, row)
+            label.setObjectName("SectionTitle")
+
+            type_label = QLabel(selected_kind, row)
+            type_label.setObjectName("CaptionMuted")
+            type_label.setMinimumWidth(62)
+            type_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            menu_btn = QToolButton(row)
+            menu_btn.setText("☰")
+            menu_btn.setToolTip("Set this question as Math or Written.")
+            menu_btn.setObjectName("actionBtn")
+            menu_btn.setMinimumSize(34, 34)
+            q_menu = QMenu(menu_btn)
+            act_math = q_menu.addAction("Math")
+            act_written = q_menu.addAction("Written")
+            act_math.triggered.connect(
+                lambda _=False, it=item, lbl=type_label: self._apply_mixed_row_kind(it, lbl, "math")
+            )
+            act_written.triggered.connect(
+                lambda _=False, it=item, lbl=type_label: self._apply_mixed_row_kind(it, lbl, "written")
+            )
+            menu_btn.setMenu(q_menu)
+            menu_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+
+            row_l.addWidget(label, stretch=1)
+            row_l.addWidget(type_label, stretch=0)
+            row_l.addWidget(menu_btn, stretch=0)
+
+            item.setSizeHint(row.sizeHint())
+            self._mixed_question_list.setItemWidget(item, row)
 
     def _on_mode_changed(self, _id: int) -> None:
         # Keep UI and status text aligned with whichever mode is active.
@@ -996,35 +1359,31 @@ class MainWindow(QMainWindow):
             return
         self._submissions_folder = Path(path)
         self._submissions_list.clear()
+        self._graded_list.clear()
+        self._last_grade_rows = None
+        self._reset_work_output_dir()
+        self._refresh_preview_pair(None, None)
         # Reset search so all newly loaded items are visible by default.
         self._search_edit.clear()
 
-        # Current grading pipeline expects PDFs; non-PDF files are only reported for now.
-        pdfs = sorted(p.name for p in self._submissions_folder.iterdir() if p.suffix.lower() == ".pdf")
-        others = [p for p in self._submissions_folder.iterdir() if p.is_file() and p.suffix.lower() != ".pdf"]
-        for name in pdfs:
-            self._submissions_list.addItem(QListWidgetItem(name))
+        # Parse folder into supported/unsupported files with a review manifest.
+        parsed = parse_submissions_folder(self._submissions_folder)
+        for pdf in parsed.pdf_files:
+            self._submissions_list.addItem(QListWidgetItem(pdf.name))
 
-        if not pdfs:
+        if not parsed.pdf_files:
             self._submissions_list.addItem(QListWidgetItem("(No PDF files in this folder)"))
 
         extra = ""
-        if others:
+        if parsed.unsupported_files:
             extra = (
-                f" {len(others)} non-PDF file(s) — in production these go to a review folder."
+                f" {len(parsed.unsupported_files)} unsupported file(s) listed in "
+                f"{parsed.unsupported_manifest.name if parsed.unsupported_manifest else 'review file'}."
             )
-        self._status.setText(f"Loaded {len(pdfs)} PDF(s) from “{self._submissions_folder.name}”.{extra}")
-        self._progress.setValue(0)
-
-    def _on_handwriting_training(self) -> None:
-        QMessageBox.information(
-            self,
-            "Handwriting training",
-            "Students submit a PDF with many samples of letters, numbers, fractions, roots, and parentheses "
-            "(e.g. ~100 repetitions per symbol).\n\n"
-            "Target ≥ 80% accuracy per student; an ensemble model is preferred.\n\n"
-            "Placeholder until training is implemented.",
+        self._status.setText(
+            f"Loaded {len(parsed.pdf_files)} PDF submission(s) from “{self._submissions_folder.name}”.{extra}"
         )
+        self._progress.setValue(0)
 
     def _on_set_answer_key(self) -> None:
         path, _filter = QFileDialog.getOpenFileName(
@@ -1035,16 +1394,125 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        self._answer_key_path = Path(path)
-        self._status.setText(f"Answer key: {self._answer_key_path.name}")
+        answer_key_path = Path(path)
+        try:
+            parsed = parse_answer_key_pdf(answer_key_path)
+        except Exception as e:
+            QMessageBox.warning(self, "Answer key", f"Could not parse answer key PDF:\n{e}")
+            return
+        self._answer_key_path = answer_key_path
+        self._answer_key_info = parsed
+        details: list[str] = [f"Answer key parsed: {parsed.path.name}"]
+        if parsed.page_count > 0:
+            details.append(f"{parsed.page_count} page(s)")
+        if parsed.question_count > 0:
+            details.append(f"{parsed.question_count} question marker(s)")
+        if parsed.total_points > 0:
+            details.append(f"{parsed.total_points} point(s) detected")
+        self._status.setText(" · ".join(details))
+
+    def _on_set_mixed_written_answer_key(self) -> None:
+        start = str(
+            self._mixed_written_answer_key_path
+            or self._answer_key_path
+            or Path.home()
+        )
+        path_str, _filter = QFileDialog.getOpenFileName(
+            self,
+            "Written answer key (PDF)",
+            start,
+            "PDF files (*.pdf);;All files (*.*)",
+        )
+        if not path_str:
+            return
+        self._mixed_written_answer_key_path = Path(path_str)
+        self._mixed_written_key_label.setText(self._mixed_written_answer_key_path.name)
+
+    def _apply_mixed_row_kind(self, item: QListWidgetItem, lbl: QLabel, kind: str) -> None:
+        if kind not in ("math", "written"):
+            return
+        lbl.setText("Math" if kind == "math" else "Written")
+        item.setData(_MIXED_KIND_ROLE, kind)
+
+    def _collect_mixed_question_kinds(self) -> list[str]:
+        kinds: list[str] = []
+        for i in range(self._mixed_question_list.count()):
+            row_item = self._mixed_question_list.item(i)
+            if not row_item:
+                continue
+            k = row_item.data(_MIXED_KIND_ROLE)
+            if k in ("math", "written"):
+                kinds.append(str(k))
+        return kinds
 
     def _on_export_grades(self) -> None:
-        QMessageBox.information(
-            self,
-            "Export grades",
-            "Exports to Excel when installed, otherwise LibreOffice Calc when detected.\n\n"
-            "Graded PDFs for Canvas will be written to your chosen output folder.",
-        )
+        default = self._submissions_folder or Path.home()
+        dlg = ExportGradesDialog(self, default_folder=default)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        opts = dlg.options()
+        if opts is None:
+            return
+
+        messages: list[str] = []
+        if opts.write_spreadsheet:
+            rows = self._last_grade_rows
+            if not rows:
+                QMessageBox.warning(
+                    self,
+                    "Export grades",
+                    "No grade rows to export. Run grading first so names and scores are available.",
+                )
+                return
+            out_xlsx = (opts.folder / opts.spreadsheet_filename).resolve()
+            try:
+                self._write_grades_spreadsheet(
+                    rows,
+                    out_path=out_xlsx,
+                    fmt=opts.spreadsheet_format,
+                )
+                messages.append(f"Spreadsheet: {out_xlsx.name}")
+            except Exception as e:
+                QMessageBox.warning(self, "Export grades", f"Could not write spreadsheet:\n{e}")
+                return
+
+        if opts.copy_graded_pdfs:
+            src_dir = self._work_graded_output_dir()
+            if not src_dir or not src_dir.is_dir():
+                QMessageBox.warning(
+                    self,
+                    "Export grades",
+                    "No temporary graded outputs found. Run grading after loading a submissions folder.",
+                )
+                if not opts.write_spreadsheet:
+                    return
+            else:
+                pdfs = sorted(src_dir.glob("graded_*.pdf"))
+                if not pdfs:
+                    QMessageBox.warning(
+                        self,
+                        "Export grades",
+                        "No graded_*.pdf files in graded_outputs. Run grading first.",
+                    )
+                    if not opts.write_spreadsheet:
+                        return
+                else:
+                    n = 0
+                    for p in pdfs:
+                        try:
+                            shutil.copy2(p, opts.folder / p.name)
+                            n += 1
+                        except OSError as e:
+                            QMessageBox.warning(
+                                self,
+                                "Export grades",
+                                f"Could not copy {p.name}:\n{e}",
+                            )
+                            return
+                    messages.append(f"Copied {n} marked PDF(s)")
+
+        self._status.setText("Export complete · " + " · ".join(messages))
+        QMessageBox.information(self, "Export grades", "\n".join(messages))
 
     def _on_run_grading_stub(self) -> None:
         if self._submissions_list.count() == 0 or (
@@ -1054,48 +1522,644 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Run grading", "Load a folder that contains student PDFs first.")
             return
 
+        # Each run starts with a clean temporary workspace.
+        self._reset_work_output_dir()
         self._progress.setRange(0, 0)
         # Indeterminate progress bar while simulated work is "running".
-        self._status.setText("Grading (stub)…")
+        self._status.setText("Grading…")
 
         def finish_stub() -> None:
-            # Simulate outputs so the rest of the UI can be exercised end-to-end.
+            # Math: CV+OCR numeric. Written: keyword rubric. Mixed: both per row kinds + optional 2nd key.
             self._progress.setRange(0, 100)
             self._progress.setValue(100)
             self._graded_list.clear()
+            if self._btn_math.isChecked():
+                if not self._submissions_folder:
+                    QMessageBox.warning(self, "Run grading", "Load a submissions folder first.")
+                    self._status.setText("Grading stopped: no submissions folder loaded.")
+                    return
+                if not self._answer_key_path:
+                    QMessageBox.warning(self, "Run grading", "Set an answer key PDF first.")
+                    self._status.setText("Grading stopped: no answer key selected.")
+                    return
+                try:
+                    scoring = parse_answer_key_scoring(self._answer_key_path)
+                except Exception as e:
+                    QMessageBox.warning(self, "Run grading", f"Could not parse numeric answer from key:\n{e}")
+                    self._status.setText("Grading stopped: answer key numeric parse failed.")
+                    return
+
+                outputs = 0
+                low_conf = 0
+                grade_rows: list[tuple[str, str]] = []
+                graded_output_dir = self._work_graded_output_dir()
+                for i in range(self._submissions_list.count()):
+                    item = self._submissions_list.item(i)
+                    if not item:
+                        continue
+                    text = item.text()
+                    if text.startswith("("):
+                        continue
+                    submission_path = self._submissions_folder / text
+                    if not submission_path.exists():
+                        self._graded_list.addItem(QListWidgetItem(f"graded_{text} — missing file"))
+                        low_conf += 1
+                        continue
+                    try:
+                        extracted = extract_submission_numeric_answer(submission_path)
+                        got = extracted.numeric_answer
+                        ok = abs(got - scoring.expected_answer) < 1e-6
+                        awarded = scoring.max_points if ok else scoring.wrong_points
+                        pct = (awarded / scoring.max_points * 100.0) if scoring.max_points > 0 else 0.0
+                        self._write_math_annotations(
+                            src_pdf=submission_path,
+                            dst_pdf=graded_output_dir / f"graded_{text}",
+                            extracted=extracted,
+                            awarded_points=awarded,
+                            max_points=scoring.max_points,
+                            percent=pct,
+                            is_correct=ok,
+                        )
+                        mark = "✓" if ok else "✗"
+                        item_text = (
+                            f"graded_{text} — {mark} got {got:.2f}, expected {scoring.expected_answer:.2f} "
+                            f"· {awarded:.2f}/{scoring.max_points:.2f} ({pct:.1f}%) "
+                            f"({extracted.best_candidate.source})"
+                        )
+                        if not ok:
+                            low_conf += 1
+                        grade_rows.append((self._name_from_submission_filename(text), f"{awarded:.2f} ({pct:.1f}%)"))
+                        outputs += 1
+                    except Exception as e:
+                        item_text = f"graded_{text} — ⚠ extraction failed: {e}"
+                        low_conf += 1
+                    self._graded_list.addItem(QListWidgetItem(item_text))
+
+                self._low_confidence_count = low_conf
+                self._refresh_review_banner()
+                self._last_grade_rows = list(grade_rows)
+                sheet_path = self._write_grades_spreadsheet(grade_rows)
+                self._status.setText(
+                    f"Math run complete. {outputs} output(s). "
+                    f"{self._low_confidence_count} item(s) need review. "
+                    f"Spreadsheet: {sheet_path.name}."
+                )
+                return
+
+            if self._btn_written.isChecked():
+                if not self._submissions_folder:
+                    QMessageBox.warning(self, "Run grading", "Load a submissions folder first.")
+                    self._status.setText("Grading stopped: no submissions folder loaded.")
+                    return
+                if not self._answer_key_path:
+                    QMessageBox.warning(self, "Run grading", "Set an answer key PDF first.")
+                    self._status.setText("Grading stopped: no answer key selected.")
+                    return
+                try:
+                    written_key = parse_written_answer_key_pdf(self._answer_key_path)
+                except Exception as e:
+                    QMessageBox.warning(
+                        self,
+                        "Run grading",
+                        "Could not parse written answer key (expect 'N pts' and 'Answer keyword list:' with "
+                        f"comma-separated keywords):\n{e}",
+                    )
+                    self._status.setText("Grading stopped: written answer key parse failed.")
+                    return
+
+                outputs = 0
+                review_count = 0
+                grade_rows: list[tuple[str, str]] = []
+                graded_output_dir = self._work_graded_output_dir()
+                review_manifest = self._work_review_manifest_path()
+                if review_manifest.exists():
+                    review_manifest.unlink()
+
+                for i in range(self._submissions_list.count()):
+                    item = self._submissions_list.item(i)
+                    if not item:
+                        continue
+                    text = item.text()
+                    if text.startswith("("):
+                        continue
+                    submission_path = self._submissions_folder / text
+                    if not submission_path.exists():
+                        self._graded_list.addItem(QListWidgetItem(f"graded_{text} — missing file"))
+                        review_count += 1
+                        continue
+                    try:
+                        result = grade_written_response_pdf(submission_path, written_key)
+                        pct = (
+                            (result.points_awarded / result.max_points * 100.0)
+                            if result.max_points > 0
+                            else 0.0
+                        )
+                        self._write_written_annotations(
+                            src_pdf=submission_path,
+                            dst_pdf=graded_output_dir / f"graded_{text}",
+                            result=result,
+                            y_offset=0.0,
+                        )
+                        if result.requires_manual_review:
+                            append_written_response_manual_review(
+                                review_manifest, submission_path, result
+                            )
+                            review_count += 1
+                            prefix = "⚠ 0 keywords — manual review · "
+                        else:
+                            prefix = ""
+                        item_text = (
+                            f"graded_{text} — {prefix}keywords {result.keyword_hits}/"
+                            f"{result.keyword_total} · {result.points_awarded:.2f}/"
+                            f"{result.max_points:.2f} ({pct:.1f}%)"
+                        )
+                        grade_rows.append(
+                            (self._name_from_submission_filename(text), f"{result.points_awarded:.2f} ({pct:.1f}%)")
+                        )
+                        outputs += 1
+                    except Exception as e:
+                        item_text = f"graded_{text} — ⚠ grading failed: {e}"
+                        review_count += 1
+                    self._graded_list.addItem(QListWidgetItem(item_text))
+
+                self._low_confidence_count = review_count
+                self._refresh_review_banner()
+                self._last_grade_rows = list(grade_rows)
+                sheet_path = self._write_grades_spreadsheet(grade_rows)
+                extra = (
+                    f" Manual review list: {review_manifest.name}."
+                    if review_manifest.exists()
+                    else ""
+                )
+                self._status.setText(
+                    f"Written run complete. {outputs} output(s). "
+                    f"{review_count} item(s) need review.{extra} "
+                    f"Spreadsheet: {sheet_path.name}."
+                )
+                return
+
+            # Mixed: run math and/or written once each per submission from row kinds + dual keys.
+            self._ensure_mixed_stub_items()
+            kinds = self._collect_mixed_question_kinds()
+            need_math, need_written = mixed_needs_from_kinds(kinds)
+            if not need_math and not need_written:
+                QMessageBox.warning(self, "Run grading", "Mixed mode has no Math or Written rows configured.")
+                self._status.setText("Grading stopped: mixed question list empty.")
+                return
+            if not self._submissions_folder:
+                QMessageBox.warning(self, "Run grading", "Load a submissions folder first.")
+                self._status.setText("Grading stopped: no submissions folder loaded.")
+                return
+            if not self._answer_key_path:
+                QMessageBox.warning(self, "Run grading", "Set the primary answer key PDF (math rubric) first.")
+                self._status.setText("Grading stopped: no answer key selected.")
+                return
+
+            scoring = None
+            if need_math:
+                try:
+                    scoring = parse_answer_key_scoring(self._answer_key_path)
+                except Exception as e:
+                    QMessageBox.warning(
+                        self,
+                        "Run grading",
+                        f"Could not parse numeric math answer key (primary PDF):\n{e}",
+                    )
+                    self._status.setText("Grading stopped: math answer key parse failed.")
+                    return
+
+            written_key = None
+            written_key_path = self._mixed_written_answer_key_path or self._answer_key_path
+            if need_written:
+                try:
+                    written_key = parse_written_answer_key_pdf(written_key_path)
+                except Exception as e:
+                    QMessageBox.warning(
+                        self,
+                        "Run grading",
+                        "Could not parse written answer key. Set “Written answer key…” to a PDF with "
+                        f"'Answer keyword list:' or use a combined key.\n{e}",
+                    )
+                    self._status.setText("Grading stopped: written answer key parse failed.")
+                    return
+
+            outputs = 0
+            review_count = 0
+            grade_rows: list[tuple[str, str]] = []
+            graded_output_dir = self._work_graded_output_dir()
+            review_manifest = self._work_review_manifest_path()
+            if need_written and review_manifest.exists():
+                review_manifest.unlink()
+
             for i in range(self._submissions_list.count()):
                 item = self._submissions_list.item(i)
+                if not item:
+                    continue
                 text = item.text()
                 if text.startswith("("):
-                    # Skip informational placeholder rows.
                     continue
-                self._graded_list.addItem(QListWidgetItem(f"graded_{text}"))
-            # Produce a non-zero review count so banner behavior can be tested.
-            self._low_confidence_count = min(3, max(1, self._graded_list.count()))
+                submission_path = self._submissions_folder / text
+                if not submission_path.exists():
+                    self._graded_list.addItem(QListWidgetItem(f"graded_{text} — missing file"))
+                    review_count += 1
+                    continue
+
+                final_dst = graded_output_dir / f"graded_{text}"
+                tmp_math = graded_output_dir / f"_mixed_tmp_math_{i}.pdf"
+                parts = compute_mixed_scores(
+                    submission_path,
+                    need_math=need_math,
+                    need_written=need_written,
+                    scoring=scoring,
+                    written_key=written_key,
+                )
+                review_count += parts.review_delta
+                if parts.written_result and parts.written_result.requires_manual_review:
+                    append_written_response_manual_review(
+                        review_manifest, submission_path, parts.written_result
+                    )
+
+                m_aw, m_max = parts.m_aw, parts.m_max
+                w_aw, w_max = parts.w_aw, parts.w_max
+                w_result = parts.written_result
+                extracted = parts.extracted
+                item_parts = list(parts.item_parts)
+
+                overlay_ok = False
+                try:
+                    if extracted is not None and scoring is not None and need_math:
+                        if w_result is not None and need_written:
+                            self._write_math_annotations(
+                                src_pdf=submission_path,
+                                dst_pdf=tmp_math,
+                                extracted=extracted,
+                                awarded_points=m_aw,
+                                max_points=m_max,
+                                percent=(m_aw / m_max * 100.0) if m_max > 0 else 0.0,
+                                is_correct=abs(extracted.numeric_answer - scoring.expected_answer) < 1e-6,
+                            )
+                            self._write_written_annotations(
+                                src_pdf=tmp_math,
+                                dst_pdf=final_dst,
+                                result=w_result,
+                                y_offset=78.0,
+                            )
+                            if tmp_math.exists():
+                                tmp_math.unlink()
+                            overlay_ok = True
+                        else:
+                            self._write_math_annotations(
+                                src_pdf=submission_path,
+                                dst_pdf=final_dst,
+                                extracted=extracted,
+                                awarded_points=m_aw,
+                                max_points=m_max,
+                                percent=(m_aw / m_max * 100.0) if m_max > 0 else 0.0,
+                                is_correct=abs(extracted.numeric_answer - scoring.expected_answer) < 1e-6,
+                            )
+                            overlay_ok = True
+                    elif w_result is not None and need_written:
+                        self._write_written_annotations(
+                            src_pdf=submission_path,
+                            dst_pdf=final_dst,
+                            result=w_result,
+                            y_offset=0.0,
+                        )
+                        overlay_ok = True
+                except Exception as pe:
+                    if tmp_math.exists():
+                        tmp_math.unlink(missing_ok=True)
+                    item_parts.append(f"PDF overlay: ⚠ {pe}")
+                    review_count += 1
+
+                total_aw, total_max, pct_total = combined_total_points(m_aw, m_max, w_aw, w_max)
+                if (
+                    overlay_ok
+                    and need_math
+                    and need_written
+                    and final_dst.is_file()
+                    and extracted is not None
+                    and w_result is not None
+                ):
+                    try:
+                        self._append_combined_grade_line(final_dst, total_aw, total_max, pct_total)
+                    except Exception as ce:
+                        item_parts.append(f"Combined line: ⚠ {ce}")
+                        review_count += 1
+                if item_parts:
+                    grade_rows.append(
+                        (self._name_from_submission_filename(text), f"{total_aw:.2f} ({pct_total:.1f}%)")
+                    )
+                    item_text = (
+                        f"graded_{text} — " + " · ".join(item_parts) + f" · combined {total_aw:.2f}/{total_max:.2f} ({pct_total:.1f}%)"
+                    )
+                    outputs += 1
+                else:
+                    item_text = f"graded_{text} — ⚠ nothing graded (check mixed row types and keys)"
+                    review_count += 1
+                self._graded_list.addItem(QListWidgetItem(item_text))
+
+            self._low_confidence_count = review_count
             self._refresh_review_banner()
+            self._last_grade_rows = list(grade_rows)
+            sheet_path = self._write_grades_spreadsheet(grade_rows)
+            extra = (
+                f" Manual review list: {review_manifest.name}."
+                if need_written and review_manifest.exists()
+                else ""
+            )
             self._status.setText(
-                f"Stub run complete. {self._graded_list.count()} output(s). "
-                f"{self._low_confidence_count} low-confidence — review before export."
+                f"Mixed run complete. {outputs} output(s). "
+                f"{review_count} item(s) need review.{extra} "
+                f"Spreadsheet: {sheet_path.name}."
             )
 
         # Delay mimics asynchronous grading completion.
         QTimer.singleShot(900, finish_stub)
 
+    def _write_math_annotations(
+        self,
+        *,
+        src_pdf: Path,
+        dst_pdf: Path,
+        extracted,
+        awarded_points: float,
+        max_points: float,
+        percent: float,
+        is_correct: bool,
+    ) -> None:
+        doc = fitz.open(str(src_pdf))
+        try:
+            if len(doc) == 0:
+                return
+            page = doc[0]
+            answer = extracted.detection.answer_box
+            pdf_ans = answer_box_rect_to_pdf_rect(answer)
+            if is_correct:
+                stroke = (0.05, 0.55, 0.12)
+                fill = (0.55, 0.92, 0.62)
+                sym_color = (0.05, 0.55, 0.12)
+            else:
+                stroke = (0.85, 0.05, 0.08)
+                fill = (0.98, 0.65, 0.62)
+                sym_color = (0.85, 0.05, 0.08)
+            ha = page.add_rect_annot(pdf_ans)
+            ha.set_colors(stroke=stroke, fill=fill)
+            ha.set_opacity(0.35)
+            ha.set_border(width=1.25)
+            ha.update()
+            # Use ASCII "X" for incorrect marks so text extraction remains reliable.
+            symbol = "✓" if is_correct else "X"
+            sym_pt = fitz.Point(pdf_ans.x1 + 6.0, (pdf_ans.y0 + pdf_ans.y1) * 0.52)
+            page.insert_text(
+                sym_pt,
+                symbol,
+                fontname=_GRADE_OVERLAY_FONT,
+                fontsize=22,
+                color=sym_color,
+            )
+            summary = f"Grade: {awarded_points:.2f}/{max_points:.2f}  ({percent:.1f}%)"
+            page.insert_text(
+                fitz.Point(360, 58),
+                summary,
+                fontname=_GRADE_OVERLAY_FONT,
+                fontsize=17,
+                color=sym_color,
+            )
+            doc.save(str(dst_pdf))
+        finally:
+            doc.close()
+
+    def _write_written_annotations(
+        self,
+        *,
+        src_pdf: Path,
+        dst_pdf: Path,
+        result: WrittenResponseGradeResult,
+        y_offset: float = 0.0,
+    ) -> None:
+        doc = fitz.open(str(src_pdf))
+        try:
+            if len(doc) == 0:
+                return
+            page = doc[0]
+            if result.matched_keywords:
+                apply_matched_keyword_highlights(doc, result.matched_keywords)
+            pct = (
+                (result.points_awarded / result.max_points * 100.0) if result.max_points > 0 else 0.0
+            )
+            yo = y_offset
+            summary = f"Grade: {result.points_awarded:.2f}/{result.max_points:.2f} ({pct:.1f}%)"
+            hits_line = f"Keywords {result.keyword_hits}/{result.keyword_total}"
+            page.insert_text(
+                fitz.Point(300, 54 + yo),
+                summary,
+                fontname=_GRADE_OVERLAY_FONT,
+                fontsize=17,
+                color=_GRADE_OVERLAY_RGB,
+            )
+            page.insert_text(
+                fitz.Point(300, 76 + yo),
+                hits_line,
+                fontname=_GRADE_OVERLAY_FONT,
+                fontsize=14,
+                color=_GRADE_OVERLAY_RGB,
+            )
+            if result.requires_manual_review:
+                page.insert_text(
+                    fitz.Point(300, 98 + yo),
+                    "MANUAL REVIEW: 0 keyword hits",
+                    fontname=_GRADE_OVERLAY_FONT,
+                    fontsize=13,
+                    color=_GRADE_OVERLAY_RGB,
+                )
+            doc.save(str(dst_pdf))
+        finally:
+            doc.close()
+
+    def _append_combined_grade_line(
+        self, pdf_path: Path, total_aw: float, total_max: float, pct: float
+    ) -> None:
+        """Add a single combined score line for mixed math+written PDFs (after per-part marks)."""
+        doc = fitz.open(str(pdf_path))
+        try:
+            if len(doc) == 0:
+                return
+            page = doc[0]
+            line = f"Combined grade: {total_aw:.2f}/{total_max:.2f} ({pct:.1f}%)"
+            page.insert_text(
+                fitz.Point(36, 30),
+                line,
+                fontname=_GRADE_OVERLAY_FONT,
+                fontsize=14,
+                color=_GRADE_OVERLAY_RGB,
+            )
+            doc.save(str(pdf_path))
+        finally:
+            doc.close()
+
+    def _pdf_first_page_as_pixmap(self, pdf_path: Path, max_w: int = 400) -> QPixmap | None:
+        try:
+            doc = fitz.open(str(pdf_path))
+            if len(doc) == 0:
+                doc.close()
+                return None
+            page = doc[0]
+            w = page.rect.width
+            scale = min(max_w / w, 2.5) if w > 0 else 1.0
+            mat = fitz.Matrix(scale, scale)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            data = QByteArray(pix.tobytes("png"))
+            img = QImage.fromData(data, "PNG")
+            doc.close()
+            if img.isNull():
+                return None
+            return QPixmap.fromImage(img)
+        except Exception:
+            return None
+
+    def _set_preview_pdf(self, label: QLabel, pdf_path: Path | None, *, empty_text: str) -> None:
+        label.setPixmap(QPixmap())
+        if pdf_path is None:
+            label.setText(empty_text)
+            return
+        pm = self._pdf_first_page_as_pixmap(pdf_path)
+        if pm is None or pm.isNull():
+            label.setText(
+                empty_text
+                if not pdf_path.is_file()
+                else f"Could not render PDF:\n{pdf_path.name}"
+            )
+            return
+        label.setPixmap(pm)
+        label.setText("")
+
+    def _refresh_preview_pair(self, orig: Path | None, graded: Path | None) -> None:
+        self._set_preview_pdf(
+            self._preview_orig_label,
+            orig,
+            empty_text="No original file selected.",
+        )
+        self._set_preview_pdf(
+            self._preview_graded_label,
+            graded,
+            empty_text="No marked PDF — run grading for this submission.",
+        )
+
+    def _work_graded_output_dir(self) -> Path:
+        out = self._work_output_dir / "graded_outputs"
+        out.mkdir(parents=True, exist_ok=True)
+        return out
+
+    def _work_review_manifest_path(self) -> Path:
+        return self._work_output_dir / "written_response_manual_review.txt"
+
+    def _reset_work_output_dir(self) -> None:
+        if self._work_output_dir.exists():
+            shutil.rmtree(self._work_output_dir, ignore_errors=True)
+        self._work_output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _write_grades_spreadsheet(
+        self,
+        rows: list[tuple[str, str]],
+        *,
+        out_path: Path | None = None,
+        fmt: str = "xlsx",
+    ) -> Path:
+        # For CSV, write a simple Name/Grade table. For XLSX, keep the existing
+        # roster-column merge behavior when an Excel roster is loaded.
+        target_dir = self._work_output_dir
+        if fmt == "csv":
+            out = out_path if out_path is not None else target_dir / "grades_output.csv"
+            with out.open("w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["Name", "Grade"])
+                w.writerows(rows)
+            return out
+
+        try:
+            from openpyxl import Workbook, load_workbook
+        except Exception as e:
+            raise RuntimeError("Spreadsheet export requires openpyxl.") from e
+
+        grade_map = {self._normalize_name_key(n): v for n, v in rows}
+
+        if self._roster_path and self._roster_path.suffix.lower() in {".xlsx", ".xlsm"} and self._roster_path.exists():
+            wb = load_workbook(self._roster_path)
+            try:
+                ws = wb.active
+                for r in range(1, ws.max_row + 1):
+                    name = ws.cell(row=r, column=1).value
+                    if not name:
+                        continue
+                    key = self._normalize_name_key(str(name))
+                    if key in grade_map:
+                        ws.cell(row=r, column=2, value=grade_map[key])
+                out = out_path if out_path is not None else target_dir / "grades_from_roster.xlsx"
+                wb.save(out)
+                return out
+            finally:
+                wb.close()
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Grades"
+        ws.cell(row=1, column=1, value="Name")
+        ws.cell(row=1, column=2, value="Grade")
+        for i, (name, grade_text) in enumerate(rows, start=2):
+            ws.cell(row=i, column=1, value=name)
+            ws.cell(row=i, column=2, value=grade_text)
+        out = out_path if out_path is not None else target_dir / "grades_output.xlsx"
+        wb.save(out)
+        return out
+
+    def _name_from_submission_filename(self, filename: str) -> str:
+        stem = Path(filename).stem
+        # Strip assignment suffix patterns like HW1 / hw_01.
+        stem = re.sub(r"(?i)hw[_\-\s]*\d+.*$", "", stem).strip("_- ")
+        # Split CamelCase tokens (MichaelSmith -> Michael Smith).
+        spaced = re.sub(r"(?<!^)([A-Z])", r" \1", stem).strip()
+        return spaced or Path(filename).stem
+
+    def _normalize_name_key(self, name: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", name.lower())
+
     def _on_submission_changed(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
         if current is None or current.text().startswith("("):
             self._title_edit.clear()
+            self._refresh_preview_pair(None, None)
             return
-        self._title_edit.setText(current.text())
+        text = current.text()
+        self._title_edit.setText(text)
+        orig: Path | None = None
+        graded: Path | None = None
+        if self._submissions_folder:
+            orig = self._submissions_folder / text
+            cand = self._work_graded_output_dir() / f"graded_{text}"
+            if cand.is_file():
+                graded = cand
+        self._refresh_preview_pair(orig, graded)
 
     def _on_graded_changed(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
         if current is None:
-            self._preview_label.setText(
-                "Select a graded output to preview.\n\n"
-                "Graded PDFs will show score / max points, percentage, and ✓ / ✗ marks."
-            )
+            self._refresh_preview_pair(None, None)
             return
         name = current.text()
-        self._preview_label.setText(
-            f"Preview placeholder: {name}\n\n"
-            "Renders PDF with marks, points earned vs possible, and percentage by student name."
-        )
+        if " — " not in name:
+            self._refresh_preview_pair(None, None)
+            return
+        graded_fn = name.split(" — ", 1)[0].strip()
+        if not graded_fn.startswith("graded_"):
+            self._refresh_preview_pair(None, None)
+            return
+        orig_fn = graded_fn[len("graded_") :]
+        orig: Path | None = None
+        graded: Path | None = None
+        if self._submissions_folder:
+            o = self._submissions_folder / orig_fn
+            if o.is_file():
+                orig = o
+            g = self._work_graded_output_dir() / graded_fn
+            if g.is_file():
+                graded = g
+        self._refresh_preview_pair(orig, graded)
