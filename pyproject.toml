@@ -44,3 +44,6 @@ include = ["ai_final_project*"]
 dev = [
     "pytest>=9.0.3",
 ]
+appimage = [
+    "pyinstaller>=6.14.0",
+]

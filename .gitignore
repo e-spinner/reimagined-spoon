@@ -15,6 +15,12 @@ env/
 dist/
 build/
 
+# AppImage / PyInstaller (packaging/appimage/build-appimage.sh)
+packaging/appimage/work/
+packaging/appimage/AppDir/
+packaging/appimage/*.AppImage
+packaging/appimage/homework-grader.png
+
 # OCR / ML caches and downloaded weights (see ai_final_project/ocr/engines.py)
 .cache/
 /doctr/

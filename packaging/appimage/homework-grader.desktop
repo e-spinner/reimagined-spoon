@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Homework Grader
+Comment=Grade homework PDFs with OCR and answer keys
+Exec=grader
+Icon=homework-grader
+Terminal=false
+Categories=Education;
+StartupWMClass=homework-grader
