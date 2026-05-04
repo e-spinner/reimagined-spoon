@@ -2,6 +2,19 @@
 
 Desktop app to help grade weekly homework: **math-style numeric answers** (with OCR and PDF markup) and **written short answers**, with a GUI to pick PDFs, an answer key, and an output folder (e.g. for upload to Canvas). When the grader is unsure, it flags items for human review.
 
+## How the program works (high level)
+
+At a high level, the app follows a repeatable grading pipeline:
+
+1. You select class inputs in the GUI: roster, answer key PDF, student submission PDFs, and output folder.
+2. The app loads rubric information from the answer key and prepares per-student grading tasks.
+3. For numeric problems, it detects answer regions in each PDF page, runs OCR (optionally with multiple engines), and compares extracted values against the key.
+4. For written responses, it extracts text, checks rubric keywords/criteria, and produces a rubric-aligned score.
+5. It combines numeric and written scores into one result per student, including confidence/review hints.
+6. It exports marked-up outputs and grading artifacts for instructor review and LMS upload.
+
+When confidence is low or extraction is ambiguous, the app explicitly flags items for manual verification instead of silently auto-grading.
+
 ## Requirements
 
 - **Python 3.12+**
@@ -66,3 +79,11 @@ The Python package under `ai_final_project/` is organized by responsibility: ent
 | `ocr/__init__.py` | Public OCR API re-exports (`OCREnsemble`, `default_engines`, errors, types). |
 | `ui/__init__.py` | UI subpackage marker. |
 | `ui/main_window.py` | PySide6 main window: file picking, grading runs, progress, PDF markup export, and review workflow. |
+
+## AI use acknowledgment and citation
+
+This entire app was programmed using Cursor with agentic AI assistance.
+
+Citation:
+
+- Cursor IDE with agentic AI models (including OpenAI GPT, Anthropic Claude, and Google Gemini model families). Assistance used across application development and documentation, 2026.
