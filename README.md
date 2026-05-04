@@ -15,6 +15,12 @@ At a high level, the app follows a repeatable grading pipeline:
 
 When confidence is low or extraction is ambiguous, the app explicitly flags items for manual verification instead of silently auto-grading.
 
+## Input format requirements
+
+- Math grading currently works only with the engineering-paper submission format described in `Reference Material/ ENGINEERING PAPER.pdf`.
+- Student submissions for numeric grading should follow the layout specified in `Reference Material/ ENGINEERING PAPER.pdf` so answer regions can be detected correctly.
+- Answer keys should also be formatted according to `Reference Materials/Math Answer Key.pdf` or `Reference Materials/Writing Answer Key.pdf` so parsing and scoring behave as expected.
+
 ## Requirements
 
 - **Python 3.12+**
@@ -42,6 +48,40 @@ uv run grader
 ```
 
 (On Windows, run the same command from PowerShell or cmd in the project directory.)
+
+## Build for Windows or macOS (PyInstaller)
+
+Windows and macOS users should build a native executable for their own operating system using PyInstaller.
+
+Important notes:
+
+- Build on the same OS you are targeting (build on Windows for Windows, build on macOS for macOS).
+- Use a clean virtual environment and install the OCR extras so bundled grading features are available.
+- The repo already includes a PyInstaller spec at `packaging/appimage/grader.spec` that collects required dependencies.
+
+### 1) Install dependencies (from repo root)
+
+```bash
+uv sync --extra ocr-ensemble --group appimage
+```
+
+### 2) Build with PyInstaller
+
+```bash
+uv run pyinstaller --noconfirm packaging/appimage/grader.spec
+```
+
+### 3) Locate build output
+
+- Main bundled folder: `dist/grader/`
+- Executable inside that folder:
+  - Windows: `dist/grader/grader.exe`
+  - macOS: `dist/grader/grader`
+
+### 4) Run the built app
+
+- On Windows, double-click `grader.exe` (or run it from PowerShell).
+- On macOS, run `dist/grader/grader` from Terminal. If Gatekeeper blocks first launch, open System Settings -> Privacy & Security and allow it, then run again.
 
 ## Run tests
 
