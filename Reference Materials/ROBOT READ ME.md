@@ -10,7 +10,7 @@
 #### what this means 
 - needs to be easy to use 
 - needs to be visually appealing (preference)
-- Mostly used on windows devices but could be used on mac or Linux devices 
+- An appimage will be create for arch linux users, windows or mac must build their own from the source code
 - must be reasonably fast
 - must be as accurate as possible
 - PDF will be the main document format
